@@ -26,7 +26,7 @@ have, and on a desktop it gives you none at all. This mod adds a labelled slider
 for every connected display, right in the Quick Settings panel, each showing its
 current level and carrying the shell's own animated brightness icon.
 
-![Per-monitor brightness sliders in Quick Settings](https://raw.githubusercontent.com/bardelyne/per-monitor-brightness/main/screenshot.png)
+![Per-monitor brightness sliders in Quick Settings](https://raw.githubusercontent.com/bardelyne/per-monitor-brightness/master/screenshot.png)
 
 ## How each display is driven
 
