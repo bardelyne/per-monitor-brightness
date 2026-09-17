@@ -3,8 +3,8 @@
 // @name            Per-monitor brightness in Quick Settings
 // @description     Adds a titled brightness slider for every connected monitor to the Windows 11 Quick Settings panel
 // @version         1.6
-// @author          evanayad0
-// @github          https://github.com/__GITHUB_USER__
+// @author          bardelyne
+// @github          https://github.com/bardelyne
 // @include         ShellHost.exe
 // @architecture    x86-64
 // @license         GPL-3.0
@@ -26,7 +26,7 @@ have, and on a desktop it gives you none at all. This mod adds a labelled slider
 for every connected display, right in the Quick Settings panel, each showing its
 current level and carrying the shell's own animated brightness icon.
 
-![Per-monitor brightness sliders in Quick Settings](https://raw.githubusercontent.com/__GITHUB_USER__/per-monitor-brightness/master/screenshot.png)
+![Per-monitor brightness sliders in Quick Settings](https://raw.githubusercontent.com/bardelyne/per-monitor-brightness/master/screenshot.png)
 
 ## How each display is driven
 
