@@ -4,8 +4,10 @@
 // @description     Adds a titled brightness slider for every connected monitor to the Windows 11 Quick Settings panel
 // @version         1.6
 // @author          evanayad0
+// @github          https://github.com/__GITHUB_USER__
 // @include         ShellHost.exe
 // @architecture    x86-64
+// @license         GPL-3.0
 // @compilerOptions -ldxva2 -lole32 -loleaut32 -lwbemuuid -luuid -lruntimeobject -lshlwapi
 // ==/WindhawkMod==
 
@@ -20,35 +22,61 @@
 # Per-monitor brightness in Quick Settings
 
 Windows gives you exactly one brightness slider no matter how many monitors you
-have, and on a desktop it gives you none at all. This mod adds a titled slider
-for every connected display, right in the Quick Settings panel.
+have, and on a desktop it gives you none at all. This mod adds a labelled slider
+for every connected display, right in the Quick Settings panel, each showing its
+current level and carrying the shell's own animated brightness icon.
 
-Each display is driven over whichever channel actually works for it:
+![Per-monitor brightness sliders in Quick Settings](https://raw.githubusercontent.com/__GITHUB_USER__/per-monitor-brightness/master/screenshot.png)
 
-- **External monitors** are driven over **DDC/CI** (VCP code `0x10`), the I2C
-  side-channel in the video cable that the monitor's own OSD uses. Most monitors
-  made in the last decade support it; some cheap ones and some USB-C docks do
-  not.
-- **Laptop internal panels** are driven over **WMI**, the same path the stock
-  slider uses.
+## How each display is driven
 
-Displays are identified by their EDID device path, so settings follow the right
-monitor across hotplug and reordering, and the sliders are ordered left to right
-to match how the monitors sit on your desk.
+- **External monitors** use **DDC/CI** (VCP code `0x10`), the I2C side-channel
+  in the video cable that the monitor's own on-screen menu uses. Most monitors
+  made in the last decade support it; some budget panels and some USB-C docks
+  do not.
+- **Laptop internal panels** use **WMI**, the same path the stock slider takes.
 
-## Notes
+A display that answers neither is listed as uncontrollable rather than being
+silently dropped.
 
-- A DDC/CI write takes roughly 50-60 ms. All hardware access happens on a
-  background thread and repeated slider values collapse into a single write, so
-  dragging never stalls the shell.
-- Monitors report brightness on their own scale, not always 0-100 (a Samsung
-  G32 reports 0-50). The mod maps percentages onto each monitor's real range.
-- If a display answers neither DDC/CI nor WMI, it is listed as uncontrollable
-  rather than silently ignored.
-- Sliders follow changes made elsewhere: the built-in panel reports brightness
-  events, so function keys move the slider live. External monitors cannot report
-  anything (DDC/CI only answers what it is asked), so those are re-read whenever
-  the panel is opened.
+## Features
+
+- One titled slider per display, showing the live percentage.
+- Sliders ordered left to right to match how the monitors sit on your desk.
+- Displays identified by EDID device path, so the right slider follows the right
+  monitor across hotplug, reordering and reboots.
+- Each slider snaps to what its monitor can actually represent. Panels do not
+  all use a 0-100 scale -- a Samsung G32 reports 0-50 -- so offering 1% steps
+  would just mean several slider positions that write the same value.
+- Function keys move the sliders live, and can optionally drive external
+  monitors too, which they cannot do on their own.
+- Monitors plugged in or unplugged are picked up immediately.
+- Values are re-read whenever the panel opens, so changes made elsewhere show up.
+- The stock brightness slider can be hidden, since it duplicates the built-in
+  panel's row.
+
+## Settings
+
+- **Hide the built-in brightness slider** -- on by default; the stock slider
+  only controls the internal panel, which already has its own row here.
+- **Laptop brightness keys control every monitor** -- `relative` (default)
+  shifts other monitors by the same amount, preserving their offset; `match`
+  sets them all to the same percentage; `off` leaves them alone.
+- **Verbose logging** -- logs every brightness write. Useful when diagnosing a
+  monitor that will not respond, noisy otherwise.
+
+## Notes and limitations
+
+- A DDC/CI write takes roughly 50-60 ms, and the bus saturates while dragging.
+  All hardware access happens on a background thread and repeated values
+  collapse into a single write, so dragging never stalls the shell -- but an
+  external monitor will visibly step rather than fade. The internal panel is
+  around ten times faster and looks smooth.
+- DDC/CI has no notification channel: a monitor only ever answers what the host
+  asks it. Brightness changed using the monitor's own buttons therefore cannot
+  be detected, and only shows up the next time the panel is opened.
+- Not every monitor implements DDC/CI correctly. If a display does not respond,
+  enable verbose logging and check whether its writes report `ok=0`.
 */
 // ==/WindhawkModReadme==
 
