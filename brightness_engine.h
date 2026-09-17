@@ -314,30 +314,12 @@ class Engine {
             return;
         }
         quit_ = false;
+        // Returns at once. The first enumeration talks to WMI and does an I2C
+        // round trip per external monitor, which can take seconds on a cold
+        // boot or through a dock -- and this is called from Wh_ModInit, before
+        // the host has started, so blocking here would delay the whole shell.
+        // Callers learn the display list from the structural change callback.
         worker_ = std::thread([this] { WorkerMain(); });
-
-        // Block only for the first enumeration, so the caller can render the
-        // UI immediately. Costs one DDC round trip per external display.
-        {
-            std::unique_lock<std::mutex> lock(mutex_);
-            ready_.wait(lock, [this] { return enumerated_ || quit_; });
-        }
-
-        // Only worth a thread if something here reports brightness events;
-        // DDC/CI has no equivalent, so this is the internal panel only.
-        bool haveWmiPanel = false;
-        {
-            std::lock_guard<std::mutex> lock(mutex_);
-            for (const auto& d : displays_) {
-                if (d.transport == Transport::Wmi) {
-                    haveWmiPanel = true;
-                    break;
-                }
-            }
-        }
-        if (haveWmiPanel) {
-            eventThread_ = std::thread([this] { EventThreadMain(); });
-        }
     }
 
     void Stop() {
@@ -430,11 +412,11 @@ class Engine {
     void WorkerMain() {
         HRESULT comHr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
 
-        // Harmless if the host process already did this (RPC_E_TOO_LATE).
-        CoInitializeSecurity(nullptr, -1, nullptr, nullptr,
-                             RPC_C_AUTHN_LEVEL_DEFAULT,
-                             RPC_C_IMP_LEVEL_IMPERSONATE, nullptr, EOAC_NONE,
-                             nullptr);
+        // Deliberately no CoInitializeSecurity: it is process-wide and this
+        // thread starts from Wh_ModInit, before the host's own startup code
+        // runs, so we would likely win the race and impose our settings on the
+        // whole process. CoSetProxyBlanket on the IWbemServices proxy is what
+        // actually governs our WMI calls.
 
         // Created here, not as a plain member: these interface pointers belong
         // to this thread's apartment and must not outlive it. Releasing them
@@ -450,6 +432,23 @@ class Engine {
             enumerated_ = true;
         }
         ready_.notify_all();
+        NotifyChanged(true);
+
+        // Only worth a thread if something here reports brightness events;
+        // DDC/CI has no equivalent, so this is the internal panel only.
+        bool haveWmiPanel = false;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            for (const auto& d : displays_) {
+                if (d.transport == Transport::Wmi) {
+                    haveWmiPanel = true;
+                    break;
+                }
+            }
+        }
+        if (haveWmiPanel) {
+            eventThread_ = std::thread([this] { EventThreadMain(); });
+        }
 
         for (;;) {
             std::map<std::wstring, int> batch;

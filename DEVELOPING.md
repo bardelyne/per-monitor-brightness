@@ -85,8 +85,47 @@ also unreliable; scan by identity.
 The sliders' `ValueChanged` handlers are code inside the mod DLL. Leaving them
 registered after unload means dragging a leftover slider calls into freed
 memory. Detach handlers, remove the elements, and do it **on the XAML thread**,
-blocking until done — then drain the dispatcher with a no-op posted at `Low`
-priority, which only runs once everything queued ahead of it has.
+blocking until done.
+
+The contract is that when `Wh_ModUninit` returns, no code from the mod image may
+still be running *or scheduled to run*. `CoreDispatcher::RunAsync` cannot satisfy
+that — it queues, so the best you get is a wait with a timeout, and on timeout
+you return anyway with your code still queued. Use a synchronous hop instead: a
+`WH_CALLWNDPROC` hook on the target thread plus `SendMessage` of a registered
+message, which has already run by the time the call returns. Same reason the
+notification center styler has `RunFromWindowThread`.
+
+That also means handlers must be reachable at teardown. A revoker owned only by
+the lambda it was captured in cannot be revoked from anywhere else — keep them
+in mod-owned globals.
+
+### Globals with destructors will crash the host at process exit
+
+`Wh_ModUninit` runs on unload, but **not** when the host process exits. There,
+the OS terminates every other thread first and then runs global destructors
+alone on the shutdown thread under the loader lock.
+
+A global holding a `std::thread` is the worst case: nothing called `Stop()`, the
+thread is still `joinable()`, and `~thread()` calls `std::terminate()` — the host
+aborts on every sign-out. Globals holding XAML objects or COM references are the
+same class of problem, releasing them after their apartment is gone.
+
+Mark them `[[clang::no_destroy]]` and clean up explicitly in `Wh_ModUninit`. See
+[the wiki page](https://github.com/ramensoftware/windhawk/wiki/Global-objects-and-process-shutdown).
+
+### Nothing may block `Wh_ModInit`
+
+It runs before the host process starts executing, so anything slow there delays
+the whole shell. Display enumeration touches WMI and does an I2C round trip per
+external monitor — seconds on a cold boot or through a dock, and unbounded if
+WMI wedges. Start the work asynchronously and let the result arrive by callback.
+
+### Never call `CoInitializeSecurity` from a mod
+
+It is process-wide, and a mod's thread starting from `Wh_ModInit` will usually
+win the race against the host's own startup — permanently imposing your settings
+on the host and making its own call fail `RPC_E_TOO_LATE`. `CoSetProxyBlanket` on
+the specific proxy is what actually governs your calls.
 
 ### WinUI2 cannot be included as shipped
 
