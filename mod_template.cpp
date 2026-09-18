@@ -1006,6 +1006,7 @@ void RemoveInjections() {
 // notification center styler uses for the same reason.
 UINT g_runMessage = 0;
 std::function<void()>* g_pendingCallback = nullptr;
+std::mutex g_runMutex;  // one hop at a time; the pending pointer is shared
 
 LRESULT CALLBACK RunCallWndProc(int code, WPARAM wParam, LPARAM lParam) {
     if (code == HC_ACTION) {
@@ -1013,7 +1014,13 @@ LRESULT CALLBACK RunCallWndProc(int code, WPARAM wParam, LPARAM lParam) {
         if (msg->message == g_runMessage && g_pendingCallback) {
             std::function<void()>* callback = g_pendingCallback;
             g_pendingCallback = nullptr;
-            (*callback)();
+            try {
+                (*callback)();
+            } catch (...) {
+                // This runs inside the shell's own window procedure dispatch;
+                // letting anything escape here takes the process down.
+                Wh_Log(L"marshalled call threw: %08X", winrt::to_hresult());
+            }
         }
     }
     return CallNextHookEx(nullptr, code, wParam, lParam);
@@ -1030,9 +1037,16 @@ bool RunOnXamlThread(std::function<void()> fn) {
         return false;  // nothing was ever injected
     }
     if (threadId == GetCurrentThreadId()) {
-        fn();
+        try {
+            fn();
+        } catch (...) {
+            Wh_Log(L"inline call threw: %08X", winrt::to_hresult());
+            return false;
+        }
         return true;
     }
+
+    std::lock_guard<std::mutex> lock(g_runMutex);
 
     HWND target = nullptr;
     EnumThreadWindows(threadId, FindThreadWindow,
@@ -1057,7 +1071,11 @@ bool RunOnXamlThread(std::function<void()> fn) {
     }
 
     g_pendingCallback = &fn;
-    SendMessage(target, g_runMessage, 0, 0);
+    // Timeout rather than a bare SendMessage: during shell startup the XAML
+    // thread may not be pumping yet, and blocking an engine thread on it
+    // forever is worse than reporting failure.
+    DWORD_PTR result = 0;
+    SendMessageTimeout(target, g_runMessage, 0, 0, SMTO_NORMAL, 10000, &result);
     bool ran = g_pendingCallback == nullptr;
     g_pendingCallback = nullptr;
     UnhookWindowsHookEx(hook);
@@ -1069,7 +1087,7 @@ bool RunOnXamlThread(std::function<void()> fn) {
 }
 
 // Pushes freshly read hardware values into the existing sliders. XAML thread.
-void ApplyRefreshedValues() {
+void ApplyRefreshedValues() try {
     if (!g_engine) {
         return;
     }
@@ -1102,11 +1120,13 @@ void ApplyRefreshedValues() {
             }
         }
     }
+} catch (...) {
+    Wh_Log(L"ApplyRefreshedValues threw: %08X", winrt::to_hresult());
 }
 
 // A monitor appeared or vanished, so the rows themselves are wrong. XAML
 // thread. The panel and its grid row are kept; only the contents are redone.
-void RebuildInjectedPanels() {
+void RebuildInjectedPanels() try {
     std::lock_guard<std::mutex> lock(g_injectionsMutex);
     size_t rebuilt = 0;
     for (Injection& injection : g_injections) {
@@ -1122,9 +1142,11 @@ void RebuildInjectedPanels() {
         ++rebuilt;
     }
     Wh_Log(L"Rebuilt %zu panel(s) after a display change", rebuilt);
+} catch (...) {
+    Wh_Log(L"RebuildInjectedPanels threw: %08X", winrt::to_hresult());
 }
 
-void OnEngineChanged(bool structural) {
+void OnEngineChanged(bool structural) try {
     if (structural && g_engine) {
         for (const brightness::Display& d : g_engine->GetDisplays()) {
             Wh_Log(L"display: %s  transport=%d  now=%d%%  vcpMax=%lu  id=%s",
@@ -1143,6 +1165,8 @@ void OnEngineChanged(bool structural) {
             ApplyRefreshedValues();
         }
     });
+} catch (...) {
+    Wh_Log(L"OnEngineChanged threw: %08X", winrt::to_hresult());
 }
 
 // Owns the mod's Win32 listening. Two jobs, both needing a message loop:

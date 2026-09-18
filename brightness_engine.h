@@ -509,8 +509,15 @@ class Engine {
             std::lock_guard<std::mutex> lock(mutex_);
             fn = onChanged_;
         }
-        if (fn) {
+        if (!fn) {
+            return;
+        }
+        try {
             fn(structural);
+        } catch (...) {
+            // Must never escape: this runs on a worker thread, and an
+            // unhandled exception there is std::terminate -> the host aborts.
+            Log(L"change callback threw; ignored");
         }
     }
 
