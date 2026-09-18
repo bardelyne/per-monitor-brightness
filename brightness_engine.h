@@ -74,6 +74,59 @@ struct Display {
 
 namespace detail {
 
+// Diagnostic breadcrumb: the host is gone by the time anything can be read
+// back, so record what was caught where it cannot be lost.
+inline void RecordFatal(const wchar_t* where, const wchar_t* what) {
+    wchar_t path[MAX_PATH];
+    DWORD n = GetTempPathW(MAX_PATH, path);
+    if (!n || n > MAX_PATH - 40) {
+        return;
+    }
+    wcscat_s(path, MAX_PATH, L"per-monitor-brightness-fatal.log");
+    HANDLE h = CreateFileW(path, FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                           nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) {
+        return;
+    }
+    SYSTEMTIME st;
+    GetLocalTime(&st);
+    static const wchar_t kCrLf[] = {13, 10, 0};
+    wchar_t line[1024];
+    int len = wsprintfW(line, L"%02d:%02d:%02d.%03d  pid=%lu  %ls: %ls%ls",
+                        st.wHour, st.wMinute, st.wSecond, st.wMilliseconds,
+                        GetCurrentProcessId(), where, what, kCrLf);
+    DWORD written = 0;
+    WriteFile(h, line, static_cast<DWORD>(len * sizeof(wchar_t)), &written, nullptr);
+    CloseHandle(h);
+}
+
+// Runs a thread body so that nothing can escape it.
+//
+// This is not defensive tidiness. An exception leaving a thread procedure
+// calls std::terminate(), which aborts the *host* process -- and everything
+// below talks to COM, WMI and I2C, all of which fail in ways that throw when
+// the shell is still starting up and those services are not ready yet. An
+// unguarded throw here takes ShellHost down, and it restarts into the same
+// throw, so the shell never comes back.
+template <class Fn>
+void RunGuarded(const wchar_t* where, Fn&& fn) noexcept {
+    try {
+        fn();
+    } catch (const _com_error& e) {
+        wchar_t buf[512];
+        wsprintfW(buf, L"_com_error %08X (%ls)", static_cast<unsigned>(e.Error()),
+                  e.ErrorMessage() ? e.ErrorMessage() : L"?");
+        RecordFatal(where, buf);
+    } catch (const std::exception& e) {
+        wchar_t buf[512];
+        MultiByteToWideChar(CP_ACP, 0, e.what(), -1, buf, 512);
+        RecordFatal(where, buf);
+    } catch (...) {
+        RecordFatal(where, L"unknown exception");
+    }
+}
+
+
 inline std::wstring GetStrProp(IWbemClassObject* obj, const wchar_t* name) {
     VARIANT v;
     VariantInit(&v);
@@ -314,7 +367,8 @@ class Engine {
             return;
         }
         quit_ = false;
-        worker_ = std::thread([this] { WorkerMain(); });
+        worker_ = std::thread(
+            [this] { detail::RunGuarded(L"WorkerMain", [this] { WorkerMain(); }); });
 
         // Deliberately blocking, despite the review asking for the opposite.
         //
@@ -460,7 +514,9 @@ class Engine {
             }
         }
         if (haveWmiPanel) {
-            eventThread_ = std::thread([this] { EventThreadMain(); });
+            eventThread_ = std::thread([this] {
+                detail::RunGuarded(L"EventThreadMain", [this] { EventThreadMain(); });
+            });
         }
 
         for (;;) {

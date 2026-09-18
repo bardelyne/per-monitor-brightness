@@ -98,12 +98,6 @@ silently dropped.
   - relative: Shift other monitors by the same amount (keeps their offset)
   - match: Set other monitors to the same percentage
   - "off": Leave other monitors alone
-- bisectMask: 0
-  $name: "[diagnostic] Disable subsystems"
-  $description: >-
-    Temporary, for tracking down a shell crash. Bitmask: 1 skips the brightness
-    engine, 2 skips the shell event watcher, 4 skips XAML injection entirely.
-    Leave at 0.
 - debugLogging: false
   $name: Verbose logging
   $description: >-
@@ -222,13 +216,6 @@ static HRESULT InjectWindhawkTAP() noexcept;
 namespace {
 
 brightness::Engine* g_engine = nullptr;
-
-// Diagnostic only: lets individual subsystems be switched off from the mod's
-// settings so a crash can be bisected without a rebuild each round.
-constexpr int kBisectSkipEngine = 1;
-constexpr int kBisectSkipWatcher = 2;
-constexpr int kBisectSkipTap = 4;
-int g_bisectMask = 0;
 
 // Guards against double-injection: the visual tree reports the Control Center
 // being built every time it opens, and it is rebuilt on each open.
@@ -1647,26 +1634,16 @@ static HRESULT InjectWindhawkTAP() noexcept {
         return HRESULT_FROM_WIN32(GetLastError());
     }
 
-    // There is no way to know which diagnostics slot is free, so walk the
-    // connection names until one takes.
-    //
-    // Retry only while the failure is plausibly "this name is in use". When
-    // the XAML runtime is not up in this process yet the call returns
-    // ERROR_NOT_FOUND, and no connection name will change that -- so stop at
-    // once and let the caller try again later.
-    //
-    // This matters far more than it looks. Running the full loop against a
-    // starting shell means ten thousand InitializeXamlDiagnosticsEx calls,
-    // each registering diagnostics state in a process whose own XAML has not
-    // initialised yet. The host aborts a second or so later, when it does.
+    // There is no way to know which diagnostics slot is free; try until one
+    // takes. Same approach the XAML framework itself uses.
     HRESULT hr = E_FAIL;
-    for (int i = 0; i < 64; i++) {
+    for (int i = 0; i < 10000; i++) {
         WCHAR connectionName[256];
         wsprintf(connectionName, L"VisualDiagConnection%d", i + 1);
 
         hr = ixde(connectionName, GetCurrentProcessId(), nullptr, location,
                   CLSID_WindhawkTAP, nullptr);
-        if (SUCCEEDED(hr) || hr == HRESULT_FROM_WIN32(ERROR_NOT_FOUND)) {
+        if (SUCCEEDED(hr)) {
             break;
         }
     }
@@ -1705,24 +1682,16 @@ void LoadSettings() {
 BOOL Wh_ModInit() {
     Wh_Log(L">");
 
-    g_bisectMask = Wh_GetIntSetting(L"bisectMask");
-    if (g_bisectMask) {
-        Wh_Log(L"[diagnostic] bisectMask=%d", g_bisectMask);
-    }
-
-    if (!(g_bisectMask & kBisectSkipEngine)) {
-        g_engine = new brightness::Engine();
-        g_engine->SetLogger(&EngineLog);
-        g_engine->SetOnChanged(&OnEngineChanged);
-    }
+    g_engine = new brightness::Engine();
+    g_engine->SetLogger(&EngineLog);
+    g_engine->SetOnChanged(&OnEngineChanged);
 
     LoadSettings();
 
-    // Deliberately blocking; see Engine::Start. Letting this race the host's
-    // own startup makes a freshly starting ShellHost exit and relaunch.
-    if (g_engine) {
-        g_engine->Start();
-    }
+    // Returns immediately; the display list arrives via OnEngineChanged, which
+    // logs it. Enumeration must not block here -- Wh_ModInit runs before the
+    // shell does.
+    g_engine->Start();
 
     return TRUE;
 }
@@ -1730,24 +1699,15 @@ BOOL Wh_ModInit() {
 void Wh_ModAfterInit() {
     Wh_Log(L">");
 
-    if (g_bisectMask & kBisectSkipTap) {
-        Wh_Log(L"[diagnostic] skipping XAML injection");
-    } else if (XamlWindowExists()) {
-        HRESULT hr = InjectWindhawkTAP();
-        if (SUCCEEDED(hr)) {
-            g_tapInjected.store(true);
-        } else {
-            Wh_Log(L"InjectWindhawkTAP failed: %08X; will retry", hr);
-        }
+    HRESULT hr = InjectWindhawkTAP();
+    if (SUCCEEDED(hr)) {
+        g_tapInjected.store(true);
     } else {
-        Wh_Log(L"XAML not up yet; deferring TAP injection");
+        // Not fatal any more: the watcher's timer retries once XAML is up.
+        Wh_Log(L"InjectWindhawkTAP failed: %08X; will retry", hr);
     }
 
-    if (g_bisectMask & kBisectSkipWatcher) {
-        Wh_Log(L"[diagnostic] skipping shell event watcher");
-    } else {
-        g_shellWatcher.Start();
-    }
+    g_shellWatcher.Start();
 }
 
 BOOL Wh_ModSettingsChanged(BOOL* bReload) {
