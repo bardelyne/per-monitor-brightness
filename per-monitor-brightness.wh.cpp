@@ -2,7 +2,7 @@
 // @id              per-monitor-brightness
 // @name            Per-monitor brightness in Quick Settings
 // @description     Adds a titled brightness slider for every connected monitor to the Windows 11 Quick Settings panel
-// @version         1.7
+// @version         1.8
 // @author          bardelyne
 // @github          https://github.com/bardelyne
 // @include         ShellHost.exe
@@ -242,6 +242,11 @@ constexpr wchar_t kAnimatedIconClass[] = L"Microsoft.UI.Xaml.Controls.AnimatedIc
 #include <vector>
 
 namespace brightness {
+
+// Minimum gap between DDC/CI writes. Long enough that the shell's UI thread
+// gets the bus back and a slider tracks the pointer; short enough that an
+// external monitor still visibly follows a drag.
+inline constexpr std::chrono::milliseconds kDdcCooldown{140};
 
 // What other displays do when the internal panel's brightness changes on its
 // own -- function keys, mostly.
@@ -736,8 +741,30 @@ class Engine {
             // Each write blocks for tens of ms. Anything the UI posts while
             // we are on the wire lands in pending_ and overwrites its
             // predecessor, so we always resume with the newest value.
+            bool wroteDdc = false;
             for (const auto& entry : batch) {
-                Apply(entry.first, entry.second);
+                if (Apply(entry.first, entry.second) == Transport::DdcCi) {
+                    wroteDdc = true;
+                }
+            }
+
+            // Breathing room after an I2C write, and it is not politeness.
+            //
+            // A DDC/CI transaction serialises against the display driver, and
+            // while one is on the wire the shell's UI thread stalls. Writing
+            // back-to-back for the whole of a slider drag -- which is what
+            // coalescing alone will happily do, one write every ~60 ms --
+            // starves the slider of pointer input, so the thumb falls behind
+            // the cursor and stops short. Drag quickly to the right-hand end
+            // and you land somewhere in the sixties, which reads as the value
+            // "drifting" on its own.
+            //
+            // So cap the write rate and let the queue coalesce in the gap. The
+            // newest value always wins, so the value the user let go of is
+            // still the one that lands, just up to kDdcCooldown later.
+            if (wroteDdc) {
+                std::unique_lock<std::mutex> lock(mutex_);
+                work_.wait_for(lock, kDdcCooldown, [this] { return quit_; });
             }
 
             if (doRefresh) {
@@ -1180,7 +1207,7 @@ class Engine {
         return attached;
     }
 
-    void Apply(const std::wstring& stableId, int percent) {
+    Transport Apply(const std::wstring& stableId, int percent) {
         HANDLE hPhysical = nullptr;
         DWORD vcpMax = 100;
         Transport transport = Transport::None;
@@ -1226,6 +1253,7 @@ class Engine {
             Log(L"apply %ls -> %d%% ok=%d (%lld ms)", stableId.c_str(), percent,
                 ok ? 1 : 0, ms);
         }
+        return transport;
     }
 
     std::thread worker_;

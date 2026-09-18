@@ -210,6 +210,35 @@ It fails with `0xC0262C07` on monitors that answer raw VCP reads and writes
 perfectly well. Use the low-level `GetVCPFeatureAndVCPFeatureReply` /
 `SetVCPFeature` and do not gate on the high-level API.
 
+### A DDC/CI write stalls the shell's UI thread
+
+Coalescing keeps the queue short, but it does not stop the worker writing
+continuously: as soon as one write finishes the next newest value goes out, so
+a slider drag puts a write on the wire roughly every 60 ms for its whole
+duration. An I2C transaction serialises against the display driver, and while
+one is in flight the shell's UI thread stalls.
+
+The result is that the slider stops tracking the pointer. Drag quickly to the
+right-hand end and the thumb falls behind and settles around 60-something
+percent, which looks exactly like the value drifting on its own afterwards --
+it is not drifting, it never got there.
+
+Measured on this machine, fast drag from ~50% to past the end:
+
+| hardware writes | where the thumb lands |
+|---|---|
+| on, unthrottled | 64%, six times out of six |
+| suppressed entirely | 100%, every time |
+| throttled to one per 140 ms | 100%, every time |
+
+The internal panel never showed it, because a WMI write is ~5 ms rather than
+~60 ms. That contrast is the cleanest way to test it: drag both sliders the
+same way and compare.
+
+So cap the DDC write rate (`kDdcCooldown`) and let the queue coalesce in the
+gap. The newest value always wins, so the value the user released on is still
+the one that lands, just slightly later.
+
 ### DDC/CI is slow and one-way
 
 ~60 ms per write, and the bus saturates during a drag — writes land ~62 ms apart

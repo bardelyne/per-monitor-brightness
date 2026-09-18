@@ -2,7 +2,7 @@
 // @id              per-monitor-brightness
 // @name            Per-monitor brightness in Quick Settings
 // @description     Adds a titled brightness slider for every connected monitor to the Windows 11 Quick Settings panel
-// @version         1.7
+// @version         1.8
 // @author          bardelyne
 // @github          https://github.com/bardelyne
 // @include         ShellHost.exe
