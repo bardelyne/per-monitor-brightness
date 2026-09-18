@@ -113,12 +113,25 @@ same class of problem, releasing them after their apartment is gone.
 Mark them `[[clang::no_destroy]]` and clean up explicitly in `Wh_ModUninit`. See
 [the wiki page](https://github.com/ramensoftware/windhawk/wiki/Global-objects-and-process-shutdown).
 
-### Nothing may block `Wh_ModInit`
+### `Wh_ModInit` must block until COM work is done
 
-It runs before the host process starts executing, so anything slow there delays
-the whole shell. Display enumeration touches WMI and does an I2C round trip per
-external monitor — seconds on a cold boot or through a dock, and unbounded if
-WMI wedges. Start the work asynchronously and let the result arrive by callback.
+The obvious reading is the opposite, and it is wrong. `Wh_ModInit` runs before
+the host process starts executing, so blocking there delays the whole shell —
+and display enumeration touches WMI and does an I2C round trip per external
+monitor. Starting that work asynchronously and taking the result by callback
+looks strictly better.
+
+It makes ShellHost exit and relaunch in a loop. The mod's COM/WMI initialisation
+then runs *concurrently with* the host's own startup instead of completing
+before it, and the host does not survive the race.
+
+What hides this: enabling the mod into an already-running shell works perfectly,
+because there is no startup left to race. Only a *freshly starting* ShellHost
+breaks — sign-out, sign-in, or `taskkill /f /im ShellHost.exe`. Test that path
+explicitly after touching anything that runs at init.
+
+Bound the wait so a wedged WMI connection cannot hang the shell indefinitely,
+but do not remove it.
 
 ### Never call `CoInitializeSecurity` from a mod
 

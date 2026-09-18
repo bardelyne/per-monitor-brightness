@@ -314,12 +314,25 @@ class Engine {
             return;
         }
         quit_ = false;
-        // Returns at once. The first enumeration talks to WMI and does an I2C
-        // round trip per external monitor, which can take seconds on a cold
-        // boot or through a dock -- and this is called from Wh_ModInit, before
-        // the host has started, so blocking here would delay the whole shell.
-        // Callers learn the display list from the structural change callback.
         worker_ = std::thread([this] { WorkerMain(); });
+
+        // Deliberately blocking, despite the review asking for the opposite.
+        //
+        // Returning early looked strictly better -- this runs from Wh_ModInit,
+        // before the host starts, and the first enumeration talks to WMI and
+        // does an I2C round trip per external monitor. But letting that work
+        // race ShellHost's own startup instead of completing before it makes
+        // the host exit and relaunch in a loop. Enabling the mod into an
+        // already-running shell always worked; only a *starting* one broke,
+        // which is why it took three attempts to see.
+        //
+        // So the wait stays, bounded so a wedged WMI connection cannot hang
+        // the shell forever.
+        {
+            std::unique_lock<std::mutex> lock(mutex_);
+            ready_.wait_for(lock, std::chrono::seconds(5),
+                            [this] { return enumerated_ || quit_; });
+        }
     }
 
     void Stop() {

@@ -1699,20 +1699,15 @@ BOOL Wh_ModInit() {
 void Wh_ModAfterInit() {
     Wh_Log(L">");
 
-    // Start the watcher first: its window and message loop are what drive the
-    // deferred TAP injection below.
-    g_shellWatcher.Start();
-
-    if (XamlWindowExists()) {
-        HRESULT hr = InjectWindhawkTAP();
-        if (SUCCEEDED(hr)) {
-            g_tapInjected.store(true);
-        } else {
-            Wh_Log(L"InjectWindhawkTAP failed: %08X; will retry", hr);
-        }
+    HRESULT hr = InjectWindhawkTAP();
+    if (SUCCEEDED(hr)) {
+        g_tapInjected.store(true);
     } else {
-        Wh_Log(L"XAML not up yet; deferring TAP injection");
+        // Not fatal any more: the watcher's timer retries once XAML is up.
+        Wh_Log(L"InjectWindhawkTAP failed: %08X; will retry", hr);
     }
+
+    g_shellWatcher.Start();
 }
 
 BOOL Wh_ModSettingsChanged(BOOL* bReload) {
