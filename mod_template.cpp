@@ -98,6 +98,12 @@ silently dropped.
   - relative: Shift other monitors by the same amount (keeps their offset)
   - match: Set other monitors to the same percentage
   - "off": Leave other monitors alone
+- bisectMask: 0
+  $name: "[diagnostic] Disable subsystems"
+  $description: >-
+    Temporary, for tracking down a shell crash. Bitmask: 1 skips the brightness
+    engine, 2 skips the shell event watcher, 4 skips XAML injection entirely.
+    Leave at 0.
 - debugLogging: false
   $name: Verbose logging
   $description: >-
@@ -216,6 +222,13 @@ static HRESULT InjectWindhawkTAP() noexcept;
 namespace {
 
 brightness::Engine* g_engine = nullptr;
+
+// Diagnostic only: lets individual subsystems be switched off from the mod's
+// settings so a crash can be bisected without a rebuild each round.
+constexpr int kBisectSkipEngine = 1;
+constexpr int kBisectSkipWatcher = 2;
+constexpr int kBisectSkipTap = 4;
+int g_bisectMask = 0;
 
 // Guards against double-injection: the visual tree reports the Control Center
 // being built every time it opens, and it is rebuilt on each open.
@@ -1692,16 +1705,24 @@ void LoadSettings() {
 BOOL Wh_ModInit() {
     Wh_Log(L">");
 
-    g_engine = new brightness::Engine();
-    g_engine->SetLogger(&EngineLog);
-    g_engine->SetOnChanged(&OnEngineChanged);
+    g_bisectMask = Wh_GetIntSetting(L"bisectMask");
+    if (g_bisectMask) {
+        Wh_Log(L"[diagnostic] bisectMask=%d", g_bisectMask);
+    }
+
+    if (!(g_bisectMask & kBisectSkipEngine)) {
+        g_engine = new brightness::Engine();
+        g_engine->SetLogger(&EngineLog);
+        g_engine->SetOnChanged(&OnEngineChanged);
+    }
 
     LoadSettings();
 
-    // Returns immediately; the display list arrives via OnEngineChanged, which
-    // logs it. Enumeration must not block here -- Wh_ModInit runs before the
-    // shell does.
-    g_engine->Start();
+    // Deliberately blocking; see Engine::Start. Letting this race the host's
+    // own startup makes a freshly starting ShellHost exit and relaunch.
+    if (g_engine) {
+        g_engine->Start();
+    }
 
     return TRUE;
 }
@@ -1709,10 +1730,9 @@ BOOL Wh_ModInit() {
 void Wh_ModAfterInit() {
     Wh_Log(L">");
 
-    // Only worth attempting once the XAML runtime is actually up. On a shell
-    // that is still starting it is not, and injecting into it early is what
-    // makes the host abort -- so hand it to the watcher's timer instead.
-    if (XamlWindowExists()) {
+    if (g_bisectMask & kBisectSkipTap) {
+        Wh_Log(L"[diagnostic] skipping XAML injection");
+    } else if (XamlWindowExists()) {
         HRESULT hr = InjectWindhawkTAP();
         if (SUCCEEDED(hr)) {
             g_tapInjected.store(true);
@@ -1723,7 +1743,11 @@ void Wh_ModAfterInit() {
         Wh_Log(L"XAML not up yet; deferring TAP injection");
     }
 
-    g_shellWatcher.Start();
+    if (g_bisectMask & kBisectSkipWatcher) {
+        Wh_Log(L"[diagnostic] skipping shell event watcher");
+    } else {
+        g_shellWatcher.Start();
+    }
 }
 
 BOOL Wh_ModSettingsChanged(BOOL* bReload) {
