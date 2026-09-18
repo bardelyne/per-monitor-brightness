@@ -2642,16 +2642,26 @@ static HRESULT InjectWindhawkTAP() noexcept {
         return HRESULT_FROM_WIN32(GetLastError());
     }
 
-    // There is no way to know which diagnostics slot is free; try until one
-    // takes. Same approach the XAML framework itself uses.
+    // There is no way to know which diagnostics slot is free, so walk the
+    // connection names until one takes.
+    //
+    // Retry only while the failure is plausibly "this name is in use". When
+    // the XAML runtime is not up in this process yet the call returns
+    // ERROR_NOT_FOUND, and no connection name will change that -- so stop at
+    // once and let the caller try again later.
+    //
+    // This matters far more than it looks. Running the full loop against a
+    // starting shell means ten thousand InitializeXamlDiagnosticsEx calls,
+    // each registering diagnostics state in a process whose own XAML has not
+    // initialised yet. The host aborts a second or so later, when it does.
     HRESULT hr = E_FAIL;
-    for (int i = 0; i < 10000; i++) {
+    for (int i = 0; i < 64; i++) {
         WCHAR connectionName[256];
         wsprintf(connectionName, L"VisualDiagConnection%d", i + 1);
 
         hr = ixde(connectionName, GetCurrentProcessId(), nullptr, location,
                   CLSID_WindhawkTAP, nullptr);
-        if (SUCCEEDED(hr)) {
+        if (SUCCEEDED(hr) || hr == HRESULT_FROM_WIN32(ERROR_NOT_FOUND)) {
             break;
         }
     }
@@ -2707,12 +2717,18 @@ BOOL Wh_ModInit() {
 void Wh_ModAfterInit() {
     Wh_Log(L">");
 
-    HRESULT hr = InjectWindhawkTAP();
-    if (SUCCEEDED(hr)) {
-        g_tapInjected.store(true);
+    // Only worth attempting once the XAML runtime is actually up. On a shell
+    // that is still starting it is not, and injecting into it early is what
+    // makes the host abort -- so hand it to the watcher's timer instead.
+    if (XamlWindowExists()) {
+        HRESULT hr = InjectWindhawkTAP();
+        if (SUCCEEDED(hr)) {
+            g_tapInjected.store(true);
+        } else {
+            Wh_Log(L"InjectWindhawkTAP failed: %08X; will retry", hr);
+        }
     } else {
-        // Not fatal any more: the watcher's timer retries once XAML is up.
-        Wh_Log(L"InjectWindhawkTAP failed: %08X; will retry", hr);
+        Wh_Log(L"XAML not up yet; deferring TAP injection");
     }
 
     g_shellWatcher.Start();

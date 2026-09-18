@@ -140,6 +140,24 @@ win the race against the host's own startup — permanently imposing your settin
 on the host and making its own call fail `RPC_E_TOO_LATE`. `CoSetProxyBlanket` on
 the specific proxy is what actually governs your calls.
 
+### Never run the TAP connection loop against a starting shell
+
+`InitializeXamlDiagnosticsEx` is called in a loop over `VisualDiagConnection1`,
+`2`, ... because there is no way to ask which diagnostics slot is free. That is
+borrowed from mods that inject into an already-running shell, where the first or
+second name takes.
+
+On a *starting* shell the failure is not "name in use", it is `ERROR_NOT_FOUND`
+(`0x80070490`) — XAML is not up yet, and no connection name will change that.
+Running the loop to its limit then makes ten thousand diagnostics registrations
+in a process whose XAML has not initialised, and the host `abort()`s about a
+second later, when it does. In Event Viewer that is `0xc0000409` in
+`ucrtbase.dll` with subcode `7` (`FAST_FAIL_FATAL_APP_EXIT`), which reads like a
+stack overrun and is not one.
+
+Break out of the loop on `ERROR_NOT_FOUND`, and do not enter it at all until a
+XAML window exists in the process.
+
 ### WinUI2 cannot be included as shipped
 
 Windhawk ships the WinUI2 C++/WinRT projection under `winrt/winui2/`, but its
