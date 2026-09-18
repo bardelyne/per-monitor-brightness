@@ -39,6 +39,12 @@
 
 namespace brightness {
 
+// Diagnostic kill switches, set from the mod's settings. Temporary.
+constexpr int kSkipEventThread = 8;
+constexpr int kSkipWmi = 16;
+constexpr int kSkipDdc = 32;
+inline int g_bisect = 0;
+
 // What other displays do when the internal panel's brightness changes on its
 // own -- function keys, mostly.
 enum class FollowMode {
@@ -77,6 +83,23 @@ namespace detail {
 // Diagnostic breadcrumb: the host is gone by the time anything can be read
 // back, so record what was caught where it cannot be lost.
 inline void RecordFatal(const wchar_t* where, const wchar_t* what) {
+    // Two channels on purpose: a file is easiest to read, but if the host
+    // cannot write it there is no way to tell that apart from "nothing was
+    // caught". The registry value proves the code ran at all.
+    {
+        HKEY k;
+        if (RegCreateKeyExW(HKEY_CURRENT_USER, L"PmbTrace", 0, nullptr, 0,
+                            KEY_SET_VALUE, nullptr, &k, nullptr) == ERROR_SUCCESS) {
+            wchar_t name[128];
+            wsprintfW(name, L"%lu_%lu_%ls", GetCurrentProcessId(),
+                      GetTickCount(), where);
+            RegSetValueExW(k, name, 0, REG_SZ,
+                           reinterpret_cast<const BYTE*>(what),
+                           static_cast<DWORD>((lstrlenW(what) + 1) * sizeof(wchar_t)));
+            RegCloseKey(k);
+        }
+    }
+
     wchar_t path[MAX_PATH];
     DWORD n = GetTempPathW(MAX_PATH, path);
     if (!n || n > MAX_PATH - 40) {
@@ -490,7 +513,9 @@ class Engine {
         // from ~Engine() on another thread, after the CoUninitialize() below,
         // is a crash.
         wmi_ = std::make_unique<WmiSession>();
-        wmi_->Init();
+        if (!(g_bisect & kSkipWmi)) {
+            wmi_->Init();
+        }
 
         Rescan();
 
@@ -513,7 +538,7 @@ class Engine {
                 }
             }
         }
-        if (haveWmiPanel) {
+        if (haveWmiPanel && !(g_bisect & kSkipEventThread)) {
             eventThread_ = std::thread([this] {
                 detail::RunGuarded(L"EventThreadMain", [this] { EventThreadMain(); });
             });
@@ -960,6 +985,10 @@ class Engine {
     // (the Samsung G32 among them) fail it with 0xC0262C07 while answering raw
     // VCP reads and writes perfectly well.
     bool TryAttachDdcCi(HMONITOR h, Display* d) {
+        if (g_bisect & kSkipDdc) {
+            return false;
+        }
+
         DWORD count = 0;
         if (!GetNumberOfPhysicalMonitorsFromHMONITOR(h, &count) || count == 0) {
             return false;
