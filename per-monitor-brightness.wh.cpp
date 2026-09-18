@@ -1200,6 +1200,10 @@ class Engine {
 
 }  // namespace brightness
 
+// Defined further down with the XAML-diagnostics plumbing; declared here so the
+// watcher's timer can retry it once XAML is up.
+static HRESULT InjectWindhawkTAP() noexcept;
+
 // ===========================================================================
 // Mod state
 // ===========================================================================
@@ -2164,6 +2168,35 @@ void OnEngineChanged(bool structural) try {
     Wh_Log(L"OnEngineChanged threw: %08X", winrt::to_hresult());
 }
 
+// XAML diagnostics can only attach once the XAML runtime is actually up. When
+// the mod loads into a *starting* ShellHost that is not true yet, and calling
+// InitializeXamlDiagnosticsEx too early fails every one of its 10000 connection
+// attempts and leaves the host unable to continue -- it exits and gets
+// relaunched, over and over. So: wait for a XAML window to exist first.
+bool XamlWindowExists() {
+    bool found = false;
+    EnumWindows(
+        [](HWND hwnd, LPARAM param) -> BOOL {
+            DWORD pid = 0;
+            GetWindowThreadProcessId(hwnd, &pid);
+            if (pid != GetCurrentProcessId()) {
+                return TRUE;
+            }
+            wchar_t className[128] = {};
+            GetClassNameW(hwnd, className, ARRAYSIZE(className));
+            if (wcsstr(className, L"Windows.UI.Core.CoreWindow") ||
+                wcsstr(className, L"ControlCenter")) {
+                *reinterpret_cast<bool*>(param) = true;
+                return FALSE;
+            }
+            return TRUE;
+        },
+        reinterpret_cast<LPARAM>(&found));
+    return found;
+}
+
+std::atomic<bool> g_tapInjected{false};
+
 // Owns the mod's Win32 listening. Two jobs, both needing a message loop:
 //   * WM_DISPLAYCHANGE, which is broadcast to top-level windows only, so a
 //     message-only window would never see it -- hence a real invisible popup.
@@ -2197,6 +2230,8 @@ class ShellEventWatcher {
     }
 
    private:
+    static constexpr UINT_PTR kTapTimerId = 1;
+
     static void CALLBACK WinEventProc(HWINEVENTHOOK, DWORD event, HWND hwnd,
                                       LONG idObject, LONG idChild, DWORD,
                                       DWORD) {
@@ -2249,7 +2284,35 @@ class ShellEventWatcher {
                     g_engine->RequestRescan();
                 }
                 break;
+            case WM_TIMER: {
+                if (wParam != kTapTimerId) {
+                    break;
+                }
+                if (g_tapInjected.load()) {
+                    KillTimer(hwnd, kTapTimerId);
+                    break;
+                }
+                static int attempts = 0;
+                if (!XamlWindowExists()) {
+                    if (++attempts > 120) {  // ~60 s, then stop trying
+                        Wh_Log(L"XAML never appeared; giving up on the TAP");
+                        KillTimer(hwnd, kTapTimerId);
+                    }
+                    break;
+                }
+                HRESULT hr = InjectWindhawkTAP();
+                if (SUCCEEDED(hr)) {
+                    g_tapInjected.store(true);
+                    Wh_Log(L"TAP injected once XAML was ready");
+                    KillTimer(hwnd, kTapTimerId);
+                } else if (++attempts > 120) {
+                    Wh_Log(L"TAP kept failing (%08X); giving up", hr);
+                    KillTimer(hwnd, kTapTimerId);
+                }
+                break;
+            }
             case WM_DESTROY:
+                KillTimer(hwnd, kTapTimerId);
                 PostQuitMessage(0);
                 break;
         }
@@ -2269,6 +2332,8 @@ class ShellEventWatcher {
                                     0, nullptr, nullptr, wc.hInstance, nullptr);
             if (!hwnd_) {
                 Wh_Log(L"Display sink window failed: %u", GetLastError());
+            } else {
+                SetTimer(hwnd_, kTapTimerId, 500, nullptr);
             }
         } else {
             Wh_Log(L"Display sink class failed: %u", GetLastError());
@@ -2629,12 +2694,20 @@ BOOL Wh_ModInit() {
 void Wh_ModAfterInit() {
     Wh_Log(L">");
 
-    HRESULT hr = InjectWindhawkTAP();
-    if (FAILED(hr)) {
-        Wh_Log(L"InjectWindhawkTAP failed: %08X", hr);
-    }
-
+    // Start the watcher first: its window and message loop are what drive the
+    // deferred TAP injection below.
     g_shellWatcher.Start();
+
+    if (XamlWindowExists()) {
+        HRESULT hr = InjectWindhawkTAP();
+        if (SUCCEEDED(hr)) {
+            g_tapInjected.store(true);
+        } else {
+            Wh_Log(L"InjectWindhawkTAP failed: %08X; will retry", hr);
+        }
+    } else {
+        Wh_Log(L"XAML not up yet; deferring TAP injection");
+    }
 }
 
 BOOL Wh_ModSettingsChanged(BOOL* bReload) {
