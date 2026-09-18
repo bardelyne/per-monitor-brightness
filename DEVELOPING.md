@@ -113,25 +113,42 @@ same class of problem, releasing them after their apartment is gone.
 Mark them `[[clang::no_destroy]]` and clean up explicitly in `Wh_ModUninit`. See
 [the wiki page](https://github.com/ramensoftware/windhawk/wiki/Global-objects-and-process-shutdown).
 
-### `Wh_ModInit` must block until COM work is done
+### A mod must not touch COM before the host has started
 
-The obvious reading is the opposite, and it is wrong. `Wh_ModInit` runs before
-the host process starts executing, so blocking there delays the whole shell —
-and display enumeration touches WMI and does an I2C round trip per external
-monitor. Starting that work asynchronously and taking the result by callback
-looks strictly better.
+This one cost a day, and every intuition about it was wrong.
 
-It makes ShellHost exit and relaunch in a loop. The mod's COM/WMI initialisation
-then runs *concurrently with* the host's own startup instead of completing
-before it, and the host does not survive the race.
+Connecting to WMI activates a COM object, and **the first COM activation in a
+process implicitly initialises COM security process-wide**. `Wh_ModInit` runs
+before ShellHost's own startup code, so a mod that talks to WMI there wins that
+race. ShellHost's own `CoInitializeSecurity` then fails `RPC_E_TOO_LATE`, and it
+fast-fails: the host aborts, restarts, does the same thing again, and the shell
+never comes back. Recovery is disabling the mod.
 
-What hides this: enabling the mod into an already-running shell works perfectly,
-because there is no startup left to race. Only a *freshly starting* ShellHost
-breaks — sign-out, sign-in, or `taskkill /f /im ShellHost.exe`. Test that path
-explicitly after touching anything that runs at init.
+Not making your own `CoInitializeSecurity` call is **not** sufficient. Any
+activation is enough. See the section below, which is still true and still not
+enough on its own.
 
-Bound the wait so a wedged WMI connection cannot hang the shell indefinitely,
-but do not remove it.
+What makes this hard to find:
+
+- Enabling the mod into an already-running shell works perfectly, every time.
+  Only a *freshly starting* ShellHost breaks -- sign-out, sign-in, or
+  `taskkill /f /im ShellHost.exe`. Test that path explicitly.
+- The fault looks like memory corruption and is not. Event Viewer reports
+  `0xc0000409` in `ucrtbase.dll`, which reads as a stack buffer overrun, but
+  the subcode (`Exception Data` = `7`) is `FAST_FAIL_FATAL_APP_EXIT` -- plain
+  `abort()`. Always read the subcode.
+- Nothing throws, so exception guards catch nothing and prove nothing.
+
+The fix is to do no COM until the host is up. This mod starts the engine from
+`StartEngineIfNeeded`, called once a XAML window exists in the process -- the
+same condition the TAP injection already waited for. Enumeration then blocks
+harmlessly, because the host is no longer waiting on us.
+
+If you need to find something like this again, bisect rather than theorise: put
+a temporary bitmask setting in the mod that switches subsystems off, then drive
+it from the registry (`HKLM\SOFTWARE\Windhawk\Engine\Mods\<id>\Settings`,
+then bump `SettingsChangeTime` to hot-reload) and count crash events in the
+Application log. That located it in four rounds after three wrong guesses.
 
 ### Never call `CoInitializeSecurity` from a mod
 

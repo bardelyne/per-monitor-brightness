@@ -39,12 +39,6 @@
 
 namespace brightness {
 
-// Diagnostic kill switches, set from the mod's settings. Temporary.
-constexpr int kSkipEventThread = 8;
-constexpr int kSkipWmi = 16;
-constexpr int kSkipDdc = 32;
-inline int g_bisect = 0;
-
 // What other displays do when the internal panel's brightness changes on its
 // own -- function keys, mostly.
 enum class FollowMode {
@@ -80,47 +74,13 @@ struct Display {
 
 namespace detail {
 
-// Diagnostic breadcrumb: the host is gone by the time anything can be read
-// back, so record what was caught where it cannot be lost.
-inline void RecordFatal(const wchar_t* where, const wchar_t* what) {
-    // Two channels on purpose: a file is easiest to read, but if the host
-    // cannot write it there is no way to tell that apart from "nothing was
-    // caught". The registry value proves the code ran at all.
-    {
-        HKEY k;
-        if (RegCreateKeyExW(HKEY_CURRENT_USER, L"PmbTrace", 0, nullptr, 0,
-                            KEY_SET_VALUE, nullptr, &k, nullptr) == ERROR_SUCCESS) {
-            wchar_t name[128];
-            wsprintfW(name, L"%lu_%lu_%ls", GetCurrentProcessId(),
-                      GetTickCount(), where);
-            RegSetValueExW(k, name, 0, REG_SZ,
-                           reinterpret_cast<const BYTE*>(what),
-                           static_cast<DWORD>((lstrlenW(what) + 1) * sizeof(wchar_t)));
-            RegCloseKey(k);
-        }
-    }
-
-    wchar_t path[MAX_PATH];
-    DWORD n = GetTempPathW(MAX_PATH, path);
-    if (!n || n > MAX_PATH - 40) {
-        return;
-    }
-    wcscat_s(path, MAX_PATH, L"per-monitor-brightness-fatal.log");
-    HANDLE h = CreateFileW(path, FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE,
-                           nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (h == INVALID_HANDLE_VALUE) {
-        return;
-    }
-    SYSTEMTIME st;
-    GetLocalTime(&st);
-    static const wchar_t kCrLf[] = {13, 10, 0};
+// Reports an exception that escaped a thread body. Deliberately not Wh_Log:
+// this header is testable outside Windhawk, so it uses the debugger channel
+// the mod's own logging ends up on anyway.
+inline void ReportEscaped(const wchar_t* where, const wchar_t* what) {
     wchar_t line[1024];
-    int len = wsprintfW(line, L"%02d:%02d:%02d.%03d  pid=%lu  %ls: %ls%ls",
-                        st.wHour, st.wMinute, st.wSecond, st.wMilliseconds,
-                        GetCurrentProcessId(), where, what, kCrLf);
-    DWORD written = 0;
-    WriteFile(h, line, static_cast<DWORD>(len * sizeof(wchar_t)), &written, nullptr);
-    CloseHandle(h);
+    wsprintfW(line, L"[per-monitor-brightness] %ls threw: %ls", where, what);
+    OutputDebugStringW(line);
 }
 
 // Runs a thread body so that nothing can escape it.
@@ -139,13 +99,13 @@ void RunGuarded(const wchar_t* where, Fn&& fn) noexcept {
         wchar_t buf[512];
         wsprintfW(buf, L"_com_error %08X (%ls)", static_cast<unsigned>(e.Error()),
                   e.ErrorMessage() ? e.ErrorMessage() : L"?");
-        RecordFatal(where, buf);
+        ReportEscaped(where, buf);
     } catch (const std::exception& e) {
         wchar_t buf[512];
         MultiByteToWideChar(CP_ACP, 0, e.what(), -1, buf, 512);
-        RecordFatal(where, buf);
+        ReportEscaped(where, buf);
     } catch (...) {
-        RecordFatal(where, L"unknown exception");
+        ReportEscaped(where, L"unknown exception");
     }
 }
 
@@ -393,18 +353,16 @@ class Engine {
         worker_ = std::thread(
             [this] { detail::RunGuarded(L"WorkerMain", [this] { WorkerMain(); }); });
 
-        // Deliberately blocking, despite the review asking for the opposite.
+        // Blocking on purpose, and safe because of when this is called.
         //
-        // Returning early looked strictly better -- this runs from Wh_ModInit,
-        // before the host starts, and the first enumeration talks to WMI and
-        // does an I2C round trip per external monitor. But letting that work
-        // race ShellHost's own startup instead of completing before it makes
-        // the host exit and relaunch in a loop. Enabling the mod into an
-        // already-running shell always worked; only a *starting* one broke,
-        // which is why it took three attempts to see.
+        // The first enumeration talks to WMI and does an I2C round trip per
+        // external monitor, so it is not fast. That is fine here: the mod does
+        // not call Start() from Wh_ModInit -- it waits until the host is up
+        // (see StartEngineIfNeeded in the mod) precisely because touching COM
+        // before then aborts the shell. By the time we get here the host has
+        // finished starting and nothing of its is being delayed.
         //
-        // So the wait stays, bounded so a wedged WMI connection cannot hang
-        // the shell forever.
+        // Still bounded, so a wedged WMI connection cannot hang the caller.
         {
             std::unique_lock<std::mutex> lock(mutex_);
             ready_.wait_for(lock, std::chrono::seconds(5),
@@ -513,9 +471,7 @@ class Engine {
         // from ~Engine() on another thread, after the CoUninitialize() below,
         // is a crash.
         wmi_ = std::make_unique<WmiSession>();
-        if (!(g_bisect & kSkipWmi)) {
-            wmi_->Init();
-        }
+        wmi_->Init();
 
         Rescan();
 
@@ -538,7 +494,7 @@ class Engine {
                 }
             }
         }
-        if (haveWmiPanel && !(g_bisect & kSkipEventThread)) {
+        if (haveWmiPanel) {
             eventThread_ = std::thread([this] {
                 detail::RunGuarded(L"EventThreadMain", [this] { EventThreadMain(); });
             });
@@ -985,10 +941,6 @@ class Engine {
     // (the Samsung G32 among them) fail it with 0xC0262C07 while answering raw
     // VCP reads and writes perfectly well.
     bool TryAttachDdcCi(HMONITOR h, Display* d) {
-        if (g_bisect & kSkipDdc) {
-            return false;
-        }
-
         DWORD count = 0;
         if (!GetNumberOfPhysicalMonitorsFromHMONITOR(h, &count) || count == 0) {
             return false;
