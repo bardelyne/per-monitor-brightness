@@ -6,7 +6,6 @@
 // @author          bardelyne
 // @github          https://github.com/bardelyne
 // @include         ShellHost.exe
-// @include         ShellExperienceHost.exe
 // @architecture    x86-64
 // @license         GPL-3.0
 // @compilerOptions -ldxva2 -lole32 -loleaut32 -lwbemuuid -luuid -lruntimeobject
@@ -68,13 +67,18 @@ silently dropped.
 
 ## Compatibility
 
-Developed and tested on Windows 11 25H2 (build 26200), where the Control
-Center is hosted by `ShellHost.exe`.
+Requires a Windows 11 build where the Control Center is hosted by
+`ShellHost.exe` -- developed and tested on 25H2 (build 26200).
 
-Earlier Windows 11 builds host it in `ShellExperienceHost.exe`, which is
-included too, so the mod will at least load there. That path is **untested** --
-if the Control Center's XAML differs on those builds the sliders may simply not
-appear. Reports welcome.
+Earlier builds host it in `ShellExperienceHost.exe` and are **not supported**.
+That process is deliberately not included: it is a XAML host too, so the mod
+would start a second copy of the brightness engine there -- a second WMI
+connection, a second DDC/CI probe of every monitor, and a second subscriber to
+the internal panel's brightness events. With "laptop brightness keys control
+every monitor" on, both copies would answer the same keypress and apply the
+change twice. Supporting those builds properly means starting the engine only
+in the process that actually hosts the Control Center, which is a change worth
+making deliberately rather than by adding an include.
 
 ## Notes and limitations
 

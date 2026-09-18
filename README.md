@@ -66,8 +66,8 @@ Requires Windows 11 with the redesigned Control Center.
 
 Developed and tested on **25H2 (build 26200)**, where the Control Center is
 hosted by `ShellHost.exe`. Earlier Windows 11 builds host it in
-`ShellExperienceHost.exe`, which the mod also targets, but that path is
-untested -- if the panel's XAML differs there the sliders may not appear.
+`ShellExperienceHost.exe` and are not supported -- see the compatibility note
+in the mod's own readme for why that process is deliberately left out.
 
 ## Development
 
