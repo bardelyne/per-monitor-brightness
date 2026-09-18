@@ -52,7 +52,7 @@ INC="/c/Program Files/Windhawk/Compiler/include"
 ## Building and installing without the GUI
 
 `install_mod.sh` compiles with Windhawk's own clang against
-`Engine\<ver>4\windhawk.lib`, drops the DLL into `Engine\Mods4` under a
+`Engine\<ver>\64\windhawk.lib`, drops the DLL into `Engine\Mods\64` under a
 fresh name, points the registry at it and bumps `SettingsChangeTime` so the
 service hot-reloads. It needs an elevated shell, since the mod's registry keys
 live under HKLM.
