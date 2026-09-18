@@ -79,15 +79,6 @@ struct Display {
 
 namespace detail {
 
-// Reports an exception that escaped a thread body. Deliberately not Wh_Log:
-// this header is testable outside Windhawk, so it uses the debugger channel
-// the mod's own logging ends up on anyway.
-inline void ReportEscaped(const wchar_t* where, const wchar_t* what) {
-    wchar_t line[1024];
-    wsprintfW(line, L"[per-monitor-brightness] %ls threw: %ls", where, what);
-    OutputDebugStringW(line);
-}
-
 // Runs a thread body so that nothing can escape it.
 //
 // This is not defensive tidiness. An exception leaving a thread procedure
@@ -96,21 +87,28 @@ inline void ReportEscaped(const wchar_t* where, const wchar_t* what) {
 // the shell is still starting up and those services are not ready yet. An
 // unguarded throw here takes ShellHost down, and it restarts into the same
 // throw, so the shell never comes back.
-template <class Fn>
-void RunGuarded(const wchar_t* where, Fn&& fn) noexcept {
+// `report` takes (where, what) and is expected to log; it must not throw.
+template <class Fn, class Report>
+void RunGuarded(const wchar_t* where, Fn&& fn, Report&& report) noexcept {
     try {
         fn();
     } catch (const _com_error& e) {
-        wchar_t buf[512];
+        wchar_t buf[512] = {};
         wsprintfW(buf, L"_com_error %08X (%ls)", static_cast<unsigned>(e.Error()),
                   e.ErrorMessage() ? e.ErrorMessage() : L"?");
-        ReportEscaped(where, buf);
+        report(where, buf);
     } catch (const std::exception& e) {
-        wchar_t buf[512];
-        MultiByteToWideChar(CP_ACP, 0, e.what(), -1, buf, 512);
-        ReportEscaped(where, buf);
+        // Zero-initialised and checked: MultiByteToWideChar returns 0 without
+        // touching the buffer when the message does not fit, and the result is
+        // handed straight to a %ls.
+        wchar_t buf[512] = {};
+        if (MultiByteToWideChar(CP_ACP, 0, e.what(), -1, buf, 512) == 0) {
+            report(where, L"(exception message too long to convert)");
+        } else {
+            report(where, buf);
+        }
     } catch (...) {
-        ReportEscaped(where, L"unknown exception");
+        report(where, L"unknown exception");
     }
 }
 
@@ -165,6 +163,16 @@ inline std::wstring GetU16ArrayProp(IWbemClassObject* obj, const wchar_t* name) 
         LONG lb = 0, ub = -1;
         SafeArrayGetLBound(sa, 1, &lb);
         SafeArrayGetUBound(sa, 1, &ub);
+        // SafeArrayGetElement writes SafeArrayGetElemsize(sa) bytes into the
+        // destination, so the element type has to be one we have actually
+        // sized a slot for. WmiMonitorID.UserFriendlyName is uint16[], which
+        // arrives as VT_I4, but bail rather than smash the stack if a future
+        // property hands us something wider.
+        if (elem != VT_UI1 && elem != VT_I2 && elem != VT_UI2 &&
+            elem != VT_I4 && elem != VT_UI4) {
+            VariantClear(&v);
+            return out;
+        }
         for (LONG i = lb; i <= ub; ++i) {
             LONG ch = 0;
             if (elem == VT_UI1) {
@@ -173,6 +181,12 @@ inline std::wstring GetU16ArrayProp(IWbemClassObject* obj, const wchar_t* name) 
                     break;
                 }
                 ch = b;
+            } else if (elem == VT_I2 || elem == VT_UI2) {
+                SHORT w = 0;
+                if (FAILED(SafeArrayGetElement(sa, &i, &w))) {
+                    break;
+                }
+                ch = static_cast<unsigned short>(w);
             } else {
                 if (FAILED(SafeArrayGetElement(sa, &i, &ch))) {
                     break;
@@ -356,7 +370,11 @@ class Engine {
         }
         quit_ = false;
         worker_ = std::thread(
-            [this] { detail::RunGuarded(L"WorkerMain", [this] { WorkerMain(); }); });
+            [this] { detail::RunGuarded(
+                    L"WorkerMain", [this] { WorkerMain(); },
+                    [this](const wchar_t* w, const wchar_t* what) {
+                        Log(L"%ls threw: %ls", w, what);
+                    }); });
 
         // Blocking on purpose, and safe because of when this is called.
         //
@@ -501,7 +519,11 @@ class Engine {
         }
         if (haveWmiPanel) {
             eventThread_ = std::thread([this] {
-                detail::RunGuarded(L"EventThreadMain", [this] { EventThreadMain(); });
+                detail::RunGuarded(
+                    L"EventThreadMain", [this] { EventThreadMain(); },
+                    [this](const wchar_t* w, const wchar_t* what) {
+                        Log(L"%ls threw: %ls", w, what);
+                    });
             });
         }
 
@@ -709,11 +731,20 @@ class Engine {
                         ULONG got = 0;
                         // Short timeout so Stop() is not kept waiting.
                         HRESULT next = events->Next(500, 1, &obj, &got);
+                        // Failure first. Any hard failure -- WMI restarting,
+                        // WBEM_E_TRANSPORT_FAILURE, WBEM_E_CALL_CANCELLED --
+                        // also comes back with got == 0, so testing the
+                        // timeout case first would swallow it and spin on a
+                        // permanently failing Next, burning a core inside the
+                        // shell until the mod is disabled.
+                        if (FAILED(next)) {
+                            Log(L"brightness events: Next failed %08X; "
+                                L"stopping the listener",
+                                static_cast<unsigned>(next));
+                            break;
+                        }
                         if (next == WBEM_S_TIMEDOUT || got != 1 || !obj) {
                             continue;
-                        }
-                        if (next != S_OK) {
-                            break;
                         }
 
                         std::wstring instance =
@@ -928,7 +959,20 @@ class Engine {
 
             // DDC/CI first: it is the only option for external panels, and on
             // a laptop it fails fast (ERROR_GEN_FAILURE) for the internal one.
-            if (TryAttachDdcCi(h, &d)) {
+            // Probing DDC/CI is not free: a monitor or dock that does not
+            // answer can take seconds to fail, and that cost is paid again on
+            // every rescan -- every hotplug, every WM_DISPLAYCHANGE. A display
+            // that did not answer is not going to start, so remember the
+            // verdict per EDID id for the life of the session.
+            std::map<std::wstring, bool>::const_iterator known =
+                ddcAnswered_.find(d.stableId);
+            bool attached = false;
+            if (known == ddcAnswered_.end() || known->second) {
+                attached = TryAttachDdcCi(h, &d);
+                ddcAnswered_[d.stableId] = attached;
+            }
+
+            if (attached) {
                 if (d.name.empty()) {
                     d.name = gdiName.empty() ? L"External display" : gdiName;
                 }
@@ -1055,6 +1099,8 @@ class Engine {
     std::thread worker_;
     std::thread eventThread_;
     std::map<std::wstring, std::chrono::steady_clock::time_point> lastRequest_;
+    // Worker thread only, so it needs no lock.
+    std::map<std::wstring, bool> ddcAnswered_;
     FollowMode followMode_ = FollowMode::Off;
     std::atomic<bool> verboseWrites_{false};
     std::mutex mutex_;

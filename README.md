@@ -62,8 +62,12 @@ Install [Windhawk](https://windhawk.net/), then either install this mod from the
 [mods catalogue](https://windhawk.net/mods), or create a new mod and paste in
 [`per-monitor-brightness.wh.cpp`](per-monitor-brightness.wh.cpp).
 
-Requires Windows 11 with the redesigned Control Center (built and verified on
-25H2, build 26200).
+Requires Windows 11 with the redesigned Control Center.
+
+Developed and tested on **25H2 (build 26200)**, where the Control Center is
+hosted by `ShellHost.exe`. Earlier Windows 11 builds host it in
+`ShellExperienceHost.exe`, which the mod also targets, but that path is
+untested -- if the panel's XAML differs there the sliders may not appear.
 
 ## Development
 

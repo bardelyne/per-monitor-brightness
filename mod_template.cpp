@@ -2,10 +2,11 @@
 // @id              per-monitor-brightness
 // @name            Per-monitor brightness in Quick Settings
 // @description     Adds a titled brightness slider for every connected monitor to the Windows 11 Quick Settings panel
-// @version         1.8
+// @version         1.9
 // @author          bardelyne
 // @github          https://github.com/bardelyne
 // @include         ShellHost.exe
+// @include         ShellExperienceHost.exe
 // @architecture    x86-64
 // @license         GPL-3.0
 // @compilerOptions -ldxva2 -lole32 -loleaut32 -lwbemuuid -luuid -lruntimeobject
@@ -65,6 +66,16 @@ silently dropped.
 - **Verbose logging** -- logs every brightness write. Useful when diagnosing a
   monitor that will not respond, noisy otherwise.
 
+## Compatibility
+
+Developed and tested on Windows 11 25H2 (build 26200), where the Control
+Center is hosted by `ShellHost.exe`.
+
+Earlier Windows 11 builds host it in `ShellExperienceHost.exe`, which is
+included too, so the mod will at least load there. That path is **untested** --
+if the Control Center's XAML differs on those builds the sliders may simply not
+appear. Reports welcome.
+
 ## Notes and limitations
 
 - A DDC/CI write takes roughly 50-60 ms, and the bus saturates while dragging.
@@ -98,11 +109,6 @@ silently dropped.
   - relative: Shift other monitors by the same amount (keeps their offset)
   - match: Set other monitors to the same percentage
   - "off": Leave other monitors alone
-- debugLogging: false
-  $name: Verbose logging
-  $description: >-
-    Log every brightness write. Useful when diagnosing a monitor that does not
-    respond; noisy otherwise.
 */
 // ==/WindhawkModSettings==
 
@@ -132,11 +138,10 @@ silently dropped.
 
 #include <atomic>
 #include <cmath>
-#include <cstdlib>
 #include <limits>
 #include <memory>
 #include <mutex>
-#include <set>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -289,7 +294,10 @@ struct StockSliderState {
     bool hidden = false;
 };
 
-[[clang::no_destroy]] StockSliderState g_stockSlider;
+// No [[clang::no_destroy]]: this holds only weak_refs, a double, an enum and
+// a bool. Destroying a weak_ref at process shutdown just decrements an
+// in-process control block, which is safe from any thread.
+StockSliderState g_stockSlider;
 bool g_loggedHideMiss = false;
 
 // Set while pushing refreshed values into sliders, so their ValueChanged
@@ -311,7 +319,13 @@ double g_progressMin = 0.0;
 double g_progressMax = 1.0;
 
 std::mutex g_injectionsMutex;
-[[clang::no_destroy]] std::vector<Injection> g_injections;
+// Wrapped rather than bare, per the Windhawk guidance on globals at process
+// shutdown: engaged from static init so it is always safe to dereference, and
+// explicitly reset at the very end of Wh_ModUninit so the XAML references go
+// while the apartment is still alive. The attribute stops the destructor from
+// running on the shutdown thread when the host exits instead.
+[[clang::no_destroy]] std::optional<std::vector<Injection>> g_injections{
+    std::in_place};
 
 // The XAML thread to marshal onto, captured at injection time. A thread id
 // rather than a CoreDispatcher: an id is a plain value with no destructor and
@@ -614,8 +628,10 @@ void SetIconLevel(wux::FrameworkElement const& icon, double percent) {
     double t = std::clamp(percent, 0.0, 100.0) / 100.0;
 
     if (auto font = icon.try_as<wuxc::FontIcon>()) {
+        // Opacity only. Changing FontSize changes the icon's measured width,
+        // and it sits in an Auto-width column, so the whole row would reflow
+        // and the slider shift sideways as the thumb moves.
         font.Opacity(0.40 + 0.60 * t);
-        font.FontSize(14.0 + 4.0 * t);
         return;
     }
 
@@ -657,8 +673,12 @@ void PopulateSliderPanel(wuxc::StackPanel const& panel, Injection& injection) {
 
     for (const brightness::Display& d : displays) {
         std::wstring displayName = d.name;
+        // One fallback for both halves of the row. Showing a thumb at 50%
+        // while the title omits the percentage reads as a bug; agreeing on 50
+        // is at least self-consistent, and the first refresh corrects it.
+        const int shownPercent = d.percent < 0 ? 50 : d.percent;
         wuxc::TextBlock title;
-        title.Text(FormatRowTitle(displayName, d.percent));
+        title.Text(FormatRowTitle(displayName, shownPercent));
         title.FontSize(12);
         title.Margin(wux::ThicknessHelper::FromLengths(0, 6, 0, 0));
         title.Opacity(0.85);
@@ -695,7 +715,7 @@ void PopulateSliderPanel(wuxc::StackPanel const& panel, Injection& injection) {
         wuxc::Slider slider;
         slider.Minimum(0);
         slider.Maximum(100);
-        slider.Value(d.percent < 0 ? 50 : d.percent);
+        slider.Value(shownPercent);
         slider.IsThumbToolTipEnabled(true);
         slider.VerticalAlignment(wux::VerticalAlignment::Center);
         wuxc::Grid::SetColumn(slider, 1);
@@ -906,10 +926,10 @@ bool InjectInto(wux::FrameworkElement const& l1Grid) {
         std::lock_guard<std::mutex> lock(g_injectionsMutex);
         // The Control Center is rebuilt on every open, so prune the entries
         // whose tree has already been torn down by the shell.
-        std::erase_if(g_injections, [](const Injection& i) {
+        std::erase_if(*g_injections, [](const Injection& i) {
             return !i.grid.get() || !i.panel.get();
         });
-        g_injections.push_back(std::move(injection));
+        g_injections->push_back(std::move(injection));
     }
 
     // We are on the XAML thread here; this is how everything else gets back to
@@ -933,7 +953,7 @@ void RemoveInjections() {
     std::vector<Injection> injections;
     {
         std::lock_guard<std::mutex> lock(g_injectionsMutex);
-        injections.swap(g_injections);
+        injections.swap(*g_injections);
     }
 
     // Unhide the stock slider first, independently of our own panel: it may
@@ -1030,34 +1050,24 @@ void RemoveInjections() {
 // DLL. SendMessage is synchronous by construction, so when it returns the
 // callback has already run. This is the same WH_CALLWNDPROC trick the
 // notification center styler uses for the same reason.
-UINT g_runMessage = 0;
-std::function<void()>* g_pendingCallback = nullptr;
-std::mutex g_runMutex;  // one hop at a time; the pending pointer is shared
-
-LRESULT CALLBACK RunCallWndProc(int code, WPARAM wParam, LPARAM lParam) {
-    if (code == HC_ACTION) {
-        auto* msg = reinterpret_cast<CWPSTRUCT*>(lParam);
-        if (msg->message == g_runMessage && g_pendingCallback) {
-            std::function<void()>* callback = g_pendingCallback;
-            g_pendingCallback = nullptr;
-            try {
-                (*callback)();
-            } catch (...) {
-                // This runs inside the shell's own window procedure dispatch;
-                // letting anything escape here takes the process down.
-                Wh_Log(L"marshalled call threw: %08X", winrt::to_hresult());
-            }
-        }
-    }
-    return CallNextHookEx(nullptr, code, wParam, lParam);
-}
-
 BOOL CALLBACK FindThreadWindow(HWND hwnd, LPARAM lParam) {
     *reinterpret_cast<HWND*>(lParam) = hwnd;
     return FALSE;  // first one will do; we only need somewhere to send to
 }
 
 bool RunOnXamlThread(std::function<void()> fn) {
+    // The callback travels in the message's own lParam rather than a global,
+    // which is how the styler mods do it. No shared pointer, so no mutex
+    // serialising unrelated hops, and no way for the callee to still be
+    // running after the caller has given up and destroyed the function.
+    static const UINT kRunMsg =
+        RegisterWindowMessage(L"Windhawk_RunFromWindowThread_" WH_MOD_ID);
+
+    struct RunParam {
+        std::function<void()>* fn;
+        bool ran;
+    };
+
     DWORD threadId = g_xamlThreadId.load();
     if (!threadId) {
         return false;  // nothing was ever injected
@@ -1072,8 +1082,6 @@ bool RunOnXamlThread(std::function<void()> fn) {
         return true;
     }
 
-    std::lock_guard<std::mutex> lock(g_runMutex);
-
     HWND target = nullptr;
     EnumThreadWindows(threadId, FindThreadWindow,
                       reinterpret_cast<LPARAM>(&target));
@@ -1081,35 +1089,48 @@ bool RunOnXamlThread(std::function<void()> fn) {
         Wh_Log(L"No window on the XAML thread; cannot marshal");
         return false;
     }
-
-    if (!g_runMessage) {
-        g_runMessage = RegisterWindowMessage(L"WindhawkPerMonitorBrightnessRun");
-        if (!g_runMessage) {
-            return false;
-        }
+    if (!kRunMsg) {
+        return false;
     }
 
-    HHOOK hook = SetWindowsHookEx(WH_CALLWNDPROC, RunCallWndProc, nullptr,
-                                  threadId);
+    HHOOK hook = SetWindowsHookEx(
+        WH_CALLWNDPROC,
+        [](int code, WPARAM wParam, LPARAM lParam) -> LRESULT {
+            if (code == HC_ACTION) {
+                auto* cwp = reinterpret_cast<const CWPSTRUCT*>(lParam);
+                if (cwp->message == kRunMsg && cwp->lParam) {
+                    auto* param = reinterpret_cast<RunParam*>(cwp->lParam);
+                    try {
+                        (*param->fn)();
+                    } catch (...) {
+                        // Runs inside the shell's own dispatch; letting
+                        // anything escape here takes the process down.
+                        Wh_Log(L"marshalled call threw: %08X",
+                               winrt::to_hresult());
+                    }
+                    param->ran = true;
+                }
+            }
+            return CallNextHookEx(nullptr, code, wParam, lParam);
+        },
+        nullptr, threadId);
     if (!hook) {
         Wh_Log(L"SetWindowsHookEx failed: %u", GetLastError());
         return false;
     }
 
-    g_pendingCallback = &fn;
-    // Timeout rather than a bare SendMessage: during shell startup the XAML
-    // thread may not be pumping yet, and blocking an engine thread on it
-    // forever is worse than reporting failure.
-    DWORD_PTR result = 0;
-    SendMessageTimeout(target, g_runMessage, 0, 0, SMTO_NORMAL, 10000, &result);
-    bool ran = g_pendingCallback == nullptr;
-    g_pendingCallback = nullptr;
+    // A plain SendMessage, not SendMessageTimeout: it cannot return while the
+    // callee is still using `param`, which is what makes the stack-allocated
+    // parameter safe. Only ever called once injection has succeeded, so the
+    // target thread is known to be pumping.
+    RunParam param{&fn, false};
+    SendMessage(target, kRunMsg, 0, reinterpret_cast<LPARAM>(&param));
     UnhookWindowsHookEx(hook);
 
-    if (!ran) {
+    if (!param.ran) {
         Wh_Log(L"Marshalled call did not run");
     }
-    return ran;
+    return param.ran;
 }
 
 // Pushes freshly read hardware values into the existing sliders. XAML thread.
@@ -1120,7 +1141,7 @@ void ApplyRefreshedValues() try {
     std::vector<brightness::Display> displays = g_engine->GetDisplays();
 
     std::lock_guard<std::mutex> lock(g_injectionsMutex);
-    for (Injection& injection : g_injections) {
+    for (Injection& injection : *g_injections) {
         for (Injection::Binding& binding : injection.bindings) {
             auto slider = binding.slider.get();
             if (!slider) {
@@ -1155,7 +1176,7 @@ void ApplyRefreshedValues() try {
 void RebuildInjectedPanels() try {
     std::lock_guard<std::mutex> lock(g_injectionsMutex);
     size_t rebuilt = 0;
-    for (Injection& injection : g_injections) {
+    for (Injection& injection : *g_injections) {
         auto panel = injection.panel.get();
         if (!panel) {
             continue;
@@ -1658,25 +1679,21 @@ static HRESULT InjectWindhawkTAP() noexcept {
     }
 
     // There is no way to know which diagnostics slot is free, so walk the
-    // connection names until one takes.
+    // connection names until one takes. ERROR_NOT_FOUND means "that name is
+    // not available", i.e. keep going -- which is the entire reason the loop
+    // exists. Anything else, success or a real error, ends it.
     //
-    // Retry only while the failure is plausibly "this name is in use". When
-    // the XAML runtime is not up in this process yet the call returns
-    // ERROR_NOT_FOUND, and no connection name will change that -- so stop at
-    // once and let the caller try again later.
-    //
-    // This matters far more than it looks. Running the full loop against a
-    // starting shell means ten thousand InitializeXamlDiagnosticsEx calls,
-    // each registering diagnostics state in a process whose own XAML has not
-    // initialised yet. The host aborts a second or so later, when it does.
+    // Getting this backwards is not academic: the Notification Center Styler
+    // targets ShellHost.exe as well, so if it holds slot 1 and we stop there,
+    // one of the two mods silently does nothing.
     HRESULT hr = E_FAIL;
     for (int i = 0; i < 64; i++) {
         WCHAR connectionName[256];
         wsprintf(connectionName, L"VisualDiagConnection%d", i + 1);
 
-        hr = ixde(connectionName, GetCurrentProcessId(), nullptr, location,
+        hr = ixde(connectionName, GetCurrentProcessId(), L"", location,
                   CLSID_WindhawkTAP, nullptr);
-        if (SUCCEEDED(hr) || hr == HRESULT_FROM_WIN32(ERROR_NOT_FOUND)) {
+        if (hr != HRESULT_FROM_WIN32(ERROR_NOT_FOUND)) {
             break;
         }
     }
@@ -1704,7 +1721,10 @@ void LoadSettings() {
     }
 
     if (g_engine) {
-        g_engine->SetVerboseWrites(Wh_GetIntSetting(L"debugLogging") != 0);
+        // Windhawk's own per-mod logging switch already gates this, and it is
+        // off by default, so a second opt-in of our own would just be a knob
+        // that has to be on before the first one does anything.
+        g_engine->SetVerboseWrites(true);
         g_engine->SetFollowMode(followMode);
     }
 
@@ -1756,6 +1776,24 @@ BOOL Wh_ModSettingsChanged(BOOL* bReload) {
     return TRUE;
 }
 
+// Removing the injected UI is not optional. RunOnXamlThread can fail for
+// reasons that have nothing to do with whether we injected -- no window found
+// yet, SetWindowsHookEx refused -- and returning anyway would leave the
+// sliders' ValueChanged handlers and the retry subscriptions registered on the
+// shell's own elements, pointing into an image Windhawk is about to unmap.
+// That is a crash on the shell's next layout pass.
+bool RemoveInjectionsWithRetry() {
+    for (int attempt = 0; attempt < 25; attempt++) {
+        if (RunOnXamlThread(&RemoveInjections)) {
+            return true;
+        }
+        Wh_Log(L"XAML thread unreachable (attempt %d); retrying before unload",
+               attempt + 1);
+        Sleep(200);
+    }
+    return false;
+}
+
 void Wh_ModUninit() {
     Wh_Log(L">");
 
@@ -1779,8 +1817,13 @@ void Wh_ModUninit() {
     }
 
     // 3. Put the visual tree back, synchronously, on the thread that owns it.
-    if (!RunOnXamlThread(&RemoveInjections)) {
-        Wh_Log(L"Could not reach the XAML thread; nothing was injected");
+    bool treeRestored = true;
+    if (g_xamlThreadId.load() == 0) {
+        Wh_Log(L"Nothing was injected; nothing to remove");
+    } else if (!RemoveInjectionsWithRetry()) {
+        Wh_Log(L"Could not reach the XAML thread after 5s; injected UI may "
+               L"still be live");
+        treeRestored = false;
     }
 
     // 4. Only now is it safe to drop the engine itself.
@@ -1790,4 +1833,19 @@ void Wh_ModUninit() {
     }
 
     g_xamlThreadId.store(0);
+
+    // Last: release the injection bookkeeping while COM is still usable. On
+    // the success path RemoveInjections has already swapped the vector empty,
+    // so this just drops the container.
+    //
+    // If the tree could not be restored it is NOT empty, and resetting would
+    // release live XAML references from this thread rather than the one that
+    // owns them. Leaking the container is the lesser evil, and is what the
+    // [[clang::no_destroy]] is there to make survivable.
+    if (treeRestored) {
+        g_injections.reset();
+    } else {
+        Wh_Log(L"Leaving injection bookkeeping alive; releasing it off the "
+               L"XAML thread would be worse");
+    }
 }
