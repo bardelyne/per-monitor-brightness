@@ -9,6 +9,7 @@
 | `brightness_engine.h` | The brightness engine. Independently testable, no UI or Windhawk dependency. |
 | `engine_test.cpp` | Standalone harness for the engine. |
 | `build_mod.sh` | Splices the engine into the template to produce the `.wh.cpp`. |
+| `install_mod.sh` | Compiles and installs the mod without the Windhawk GUI, then hot-reloads it. Needs an elevated shell. |
 
 Windhawk mods must be a single source file, hence the splice step. Keeping the
 engine separate is what allowed it to be tested outside the shell — which is how
@@ -47,6 +48,26 @@ INC="/c/Program Files/Windhawk/Compiler/include"
 
 `__USE_MINGW_ANSI_STDIO=0` is not optional. Without it, `%s` in a **wide**
 `printf` means a *narrow* string and passing `wchar_t*` walks off into garbage.
+
+## Building and installing without the GUI
+
+`install_mod.sh` compiles with Windhawk's own clang against
+`Engine\<ver>4\windhawk.lib`, drops the DLL into `Engine\Mods4` under a
+fresh name, points the registry at it and bumps `SettingsChangeTime` so the
+service hot-reloads. It needs an elevated shell, since the mod's registry keys
+live under HKLM.
+
+Two things it must get right, both of which fail silently otherwise:
+
+- **`-Wl,--export-all-symbols`.** Without it nothing is exported, Windhawk
+  loads the DLL, finds no `Wh_ModInit`, and the mod simply never runs. It looks
+  exactly like a mod that loads fine and does nothing.
+- **A new DLL filename each build.** A loaded DLL is memory-mapped and cannot
+  be overwritten.
+
+Always verify the mod actually *ran* -- a breadcrumb it writes, or observable
+behaviour -- rather than trusting that the DLL appears in the process's module
+list.
 
 ## Debugging
 
