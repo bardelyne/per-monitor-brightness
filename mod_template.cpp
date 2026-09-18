@@ -2,7 +2,7 @@
 // @id              per-monitor-brightness
 // @name            Per-monitor brightness in Quick Settings
 // @description     Adds a titled brightness slider for every connected monitor to the Windows 11 Quick Settings panel
-// @version         1.9
+// @version         2.0
 // @author          bardelyne
 // @github          https://github.com/bardelyne
 // @include         ShellHost.exe
@@ -62,8 +62,6 @@ silently dropped.
 - **Laptop brightness keys control every monitor** -- `relative` (default)
   shifts other monitors by the same amount, preserving their offset; `match`
   sets them all to the same percentage; `off` leaves them alone.
-- **Verbose logging** -- logs every brightness write. Useful when diagnosing a
-  monitor that will not respond, noisy otherwise.
 
 ## Compatibility
 
@@ -108,7 +106,9 @@ making deliberately rather than by adding an include.
   $description: >-
     Function keys only reach the built-in panel -- that is a hardware limit, not
     a Windows one. This mirrors those keypresses onto external monitors over
-    DDC/CI, so one keypress dims everything.
+    DDC/CI, so one keypress dims everything. It follows the keys and anything
+    else that changes the panel itself; dragging the built-in display's own
+    slider here leaves the other monitors alone.
   $options:
   - relative: Shift other monitors by the same amount (keeps their offset)
   - match: Set other monitors to the same percentage
@@ -785,7 +785,12 @@ wuxc::StackPanel BuildSliderPanel(Injection& injection) {
 // carries -- the volume row has no such element -- and walk up to its item.
 bool TryHideStockBrightness(wux::FrameworkElement const& l1Grid) {
     if (g_stockSlider.hidden) {
-        return true;
+        if (g_stockSlider.item.get()) {
+            return true;  // still the tree we hid
+        }
+        // The view was rebuilt: our weak refs point into the dead tree, so the
+        // new one has an unhidden stock row and unload would restore nothing.
+        g_stockSlider = StockSliderState{};
     }
 
     auto group = FindDescendant(
@@ -1158,9 +1163,16 @@ void ApplyRefreshedValues() try {
                 if (std::abs(slider.Value() - d.percent) < 0.5) {
                     break;  // already correct, leave the thumb alone
                 }
-                g_suppressValueChanged = true;
-                slider.Value(d.percent);
-                g_suppressValueChanged = false;
+                // Scoped: if Value() throws, the outer catch would otherwise
+                // swallow it with the flag stuck true, and from then on every
+                // drag is silently ignored until the mod is reloaded.
+                {
+                    struct Suppress {
+                        Suppress() { g_suppressValueChanged = true; }
+                        ~Suppress() { g_suppressValueChanged = false; }
+                    } guard;
+                    slider.Value(d.percent);
+                }
                 if (auto icon = binding.icon.get()) {
                     SetIconLevel(icon, d.percent);
                 }
@@ -1470,6 +1482,14 @@ bool TryInject(wux::DependencyObject const& controlCenterView) {
 // Loaded/LayoutUpdated remain as retries for the case where it really is not
 // ready yet; both are revoked as soon as one succeeds.
 void AttachInjector(wux::FrameworkElement const& view) {
+    // We are on the XAML thread, so record it here rather than only on a
+    // successful injection. The retry handlers below are registered on the
+    // shell's own element whether or not the tree was ready, and Wh_ModUninit
+    // keys "is there anything to remove?" off this id -- so leaving it unset
+    // in exactly the case the retries exist for would return from unload with
+    // live revokers pointing into an image Windhawk is about to unmap.
+    g_xamlThreadId.store(GetCurrentThreadId());
+
     if (TryInject(view)) {
         return;
     }
@@ -1725,10 +1745,6 @@ void LoadSettings() {
     }
 
     if (g_engine) {
-        // Windhawk's own per-mod logging switch already gates this, and it is
-        // off by default, so a second opt-in of our own would just be a knob
-        // that has to be on before the first one does anything.
-        g_engine->SetVerboseWrites(true);
         g_engine->SetFollowMode(followMode);
     }
 
@@ -1773,7 +1789,7 @@ BOOL Wh_ModSettingsChanged(BOOL* bReload) {
     bool previouslyHidden = g_hideStockBrightness;
     LoadSettings();
 
-    // Follow mode and verbose logging are engine state and take effect at once.
+    // Follow mode is engine state and takes effect at once.
     // Hiding the stock slider changes what was injected into somebody else's
     // visual tree, so only that one needs a reload to rebuild it.
     *bReload = (g_hideStockBrightness != previouslyHidden);
@@ -1801,26 +1817,30 @@ bool RemoveInjectionsWithRetry() {
 void Wh_ModUninit() {
     Wh_Log(L">");
 
+    // Order matters. Everything that could still call into this DLL has to be
+    // stopped before the UI is dismantled, and all of it has to be finished
+    // before we return -- Windhawk frees the module the moment we do.
+
+    // 1. The watcher first, and before the unadvise below: its 500 ms timer
+    //    retries InjectWindhawkTAP, and a TAP landing after the unadvise would
+    //    build and advise a brand new VisualTreeWatcher that then survives the
+    //    unload, still registered with XAML diagnostics.
+    g_shellWatcher.Stop();
+
+    // 2. Now no more tree notifications can arrive.
     if (g_visualTreeWatcher) {
         g_visualTreeWatcher->UnadviseVisualTreeChange();
         g_visualTreeWatcher = nullptr;
     }
 
-    // Order matters. Everything that could still call into this DLL has to be
-    // stopped before the UI is dismantled, and all of it has to be finished
-    // before we return -- Windhawk frees the module the moment we do.
-
-    // 1. No more refresh requests.
-    g_shellWatcher.Stop();
-
-    // 2. No more engine callbacks, and join both engine threads so none can be
+    // 3. No more engine callbacks, and join both engine threads so none can be
     //    in flight. After this nothing can ask to run on the XAML thread.
     if (g_engine) {
         g_engine->SetOnChanged(nullptr);
         g_engine->Stop();
     }
 
-    // 3. Put the visual tree back, synchronously, on the thread that owns it.
+    // 4. Put the visual tree back, synchronously, on the thread that owns it.
     bool treeRestored = true;
     if (g_xamlThreadId.load() == 0) {
         Wh_Log(L"Nothing was injected; nothing to remove");
@@ -1830,7 +1850,7 @@ void Wh_ModUninit() {
         treeRestored = false;
     }
 
-    // 4. Only now is it safe to drop the engine itself.
+    // 5. Only now is it safe to drop the engine itself.
     if (g_engine) {
         delete g_engine;
         g_engine = nullptr;

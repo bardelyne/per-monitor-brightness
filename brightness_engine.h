@@ -93,9 +93,13 @@ void RunGuarded(const wchar_t* where, Fn&& fn, Report&& report) noexcept {
     try {
         fn();
     } catch (const _com_error& e) {
+        // swprintf, not wsprintf: wsprintf does not bound its output to the
+        // destination, and _com_error::ErrorMessage() can carry an arbitrarily
+        // long IErrorInfo description from a WMI provider.
         wchar_t buf[512] = {};
-        wsprintfW(buf, L"_com_error %08X (%ls)", static_cast<unsigned>(e.Error()),
-                  e.ErrorMessage() ? e.ErrorMessage() : L"?");
+        swprintf(buf, ARRAYSIZE(buf), L"_com_error %08X (%ls)",
+                 static_cast<unsigned>(e.Error()),
+                 e.ErrorMessage() ? e.ErrorMessage() : L"?");
         report(where, buf);
     } catch (const std::exception& e) {
         // Zero-initialised and checked: MultiByteToWideChar returns 0 without
@@ -270,7 +274,15 @@ class WmiSession {
 
     bool Ok() const { return services_ != nullptr; }
 
+    // Lets a long enumeration give up when the engine is shutting down.
+    void SetStopFlag(const std::atomic<bool>* stopping) { stopping_ = stopping; }
+
     IWbemServices* Services() const { return services_; }
+
+   private:
+    const std::atomic<bool>* stopping_ = nullptr;
+
+   public:
 
     template <class Fn>
     void ForEach(const wchar_t* wql, Fn&& fn) {
@@ -284,11 +296,22 @@ class WmiSession {
         if (FAILED(hr) || !e) {
             return;
         }
+        // Bounded, not WBEM_INFINITE. A wedged or slow WMI provider is a
+        // common enough failure, and this runs on the worker thread that
+        // Wh_ModUninit joins -- an unbounded wait there hangs the unload, so
+        // the mod can neither be disabled nor updated.
         for (;;) {
+            if (stopping_ && stopping_->load()) {
+                break;
+            }
             IWbemClassObject* obj = nullptr;
             ULONG got = 0;
-            if (e->Next(WBEM_INFINITE, 1, &obj, &got) != S_OK || got != 1) {
-                break;
+            HRESULT next = e->Next(1000, 1, &obj, &got);
+            if (next == WBEM_S_TIMEDOUT) {
+                continue;  // re-check the stop flag and keep waiting
+            }
+            if (next != S_OK || got != 1) {
+                break;  // exhausted or failed
             }
             fn(obj);
             obj->Release();
@@ -357,7 +380,6 @@ class Engine {
 
     // Per-write logging is invaluable while debugging and pure noise in daily
     // use, so it is off unless asked for.
-    void SetVerboseWrites(bool verbose) { verboseWrites_.store(verbose); }
 
     void SetFollowMode(FollowMode mode) {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -394,6 +416,10 @@ class Engine {
     }
 
     void Stop() {
+        // Set before the lock so anything already inside a long hardware or
+        // WMI call can notice and unwind, rather than being noticed only when
+        // it next comes back around to the loop condition.
+        stopping_.store(true);
         {
             std::lock_guard<std::mutex> lock(mutex_);
             quit_ = true;
@@ -494,6 +520,7 @@ class Engine {
         // from ~Engine() on another thread, after the CoUninitialize() below,
         // is a crash.
         wmi_ = std::make_unique<WmiSession>();
+        wmi_->SetStopFlag(&stopping_);
         wmi_->Init();
 
         Rescan();
@@ -704,6 +731,7 @@ class Engine {
 
         {
             WmiSession session;
+            session.SetStopFlag(&stopping_);
             if (!session.Init() || !session.Services()) {
                 Log(L"brightness events: no WMI connection");
             } else {
@@ -921,6 +949,12 @@ class Engine {
         std::vector<Display> found;
 
         for (HMONITOR h : handles) {
+            // Probing a monitor that does not answer DDC/CI can take seconds,
+            // and the loop is otherwise uninterruptible, so an unload landing
+            // mid-rescan would wait for all of them.
+            if (stopping_.load()) {
+                break;
+            }
             MONITORINFOEXW mi{};
             mi.cbSize = sizeof(mi);
             if (!GetMonitorInfoW(h, &mi)) {
@@ -1089,10 +1123,10 @@ class Engine {
                            std::chrono::steady_clock::now() - start)
                            .count();
         writes_.fetch_add(1);
-        if (verboseWrites_.load()) {
-            Log(L"apply %ls -> %d%% ok=%d (%lld ms)", stableId.c_str(), percent,
-                ok ? 1 : 0, ms);
-        }
+        // Unconditional: Windhawk's own per-mod logging switch already gates
+        // whether any of this is emitted, and it is off by default.
+        Log(L"apply %ls -> %d%% ok=%d (%lld ms)", stableId.c_str(), percent,
+            ok ? 1 : 0, ms);
         return transport;
     }
 
@@ -1102,7 +1136,7 @@ class Engine {
     // Worker thread only, so it needs no lock.
     std::map<std::wstring, bool> ddcAnswered_;
     FollowMode followMode_ = FollowMode::Off;
-    std::atomic<bool> verboseWrites_{false};
+    std::atomic<bool> stopping_{false};
     std::mutex mutex_;
     std::condition_variable work_;
     std::condition_variable ready_;

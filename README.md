@@ -42,7 +42,6 @@ silently dropped.
 |---|---|---|
 | Hide the built-in brightness slider | on | Collapses the stock row, which only controls the internal panel |
 | Laptop brightness keys control every monitor | `relative` | `relative` shifts others by the same delta, preserving their offsets; `match` sets them all equal; `off` disables |
-| Verbose logging | off | Logs every brightness write; useful when a monitor will not respond |
 
 ## Limitations
 
@@ -53,8 +52,9 @@ silently dropped.
 - DDC/CI has no notification channel: a monitor only ever answers what the host
   asks it. Brightness changed using the monitor's own buttons cannot be
   detected, and only shows up the next time the panel is opened.
-- Not every monitor implements DDC/CI correctly. If one does not respond, turn
-  on verbose logging and check whether its writes report `ok=0`.
+- Not every monitor implements DDC/CI correctly. If one does not respond,
+  enable logging for the mod in Windhawk's settings and check whether its
+  writes report `ok=0`.
 
 ## Installing
 
