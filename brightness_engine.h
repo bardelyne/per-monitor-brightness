@@ -15,7 +15,6 @@
 
 #include <windows.h>
 
-#include <highlevelmonitorconfigurationapi.h>
 #include <lowlevelmonitorconfigurationapi.h>
 #include <physicalmonitorenumerationapi.h>
 
@@ -628,6 +627,16 @@ class Engine {
             if (doRefresh) {
                 RefreshValues();
                 NotifyChanged(false);
+
+                // Opening the panel is the moment a missing slider is
+                // noticed, and it is also the only regular event this engine
+                // gets -- nothing polls. So that is where an expired DDC/CI
+                // verdict is retried, and only if one has actually expired,
+                // which is a map lookup per display in the common case.
+                if (AnyDdcRetryDue()) {
+                    Rescan();
+                    NotifyChanged(true);
+                }
             }
         }
 
@@ -989,6 +998,45 @@ class Engine {
         return TRUE;
     }
 
+    // How long to leave a failed DDC/CI probe alone: 30s, then a minute, then
+    // doubling to a 16-minute ceiling. Short enough that a monitor which was
+    // merely asleep comes back on its own; long enough that a monitor which
+    // genuinely has no DDC/CI is not costing seconds per rescan.
+    static std::chrono::steady_clock::duration DdcRetryDelay(int failures) {
+        int shift = failures - 1;
+        if (shift < 0) {
+            shift = 0;
+        } else if (shift > 5) {
+            shift = 5;
+        }
+        return std::chrono::seconds(30) * (1 << shift);
+    }
+
+    // Whether any display currently written off as uncontrollable is due
+    // another probe. Worker thread.
+    bool AnyDdcRetryDue() {
+        const std::chrono::steady_clock::time_point now =
+            std::chrono::steady_clock::now();
+        std::vector<Display> snapshot;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            snapshot = displays_;
+        }
+        for (const Display& d : snapshot) {
+            if (d.transport != Transport::None) {
+                continue;
+            }
+            std::map<std::wstring, DdcVerdict>::const_iterator known =
+                ddcAnswered_.find(d.stableId);
+            if (known != ddcAnswered_.end() && !known->second.answered &&
+                (now - known->second.taken) >=
+                    DdcRetryDelay(known->second.failures)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     void Rescan() {
         ReleasePhysicalMonitors();
 
@@ -1046,15 +1094,33 @@ class Engine {
             // a laptop it fails fast (ERROR_GEN_FAILURE) for the internal one.
             // Probing DDC/CI is not free: a monitor or dock that does not
             // answer can take seconds to fail, and that cost is paid again on
-            // every rescan -- every hotplug, every WM_DISPLAYCHANGE. A display
-            // that did not answer is not going to start, so remember the
-            // verdict per EDID id for the life of the session.
-            std::map<std::wstring, bool>::const_iterator known =
+            // every rescan -- every hotplug, every WM_DISPLAYCHANGE. So a
+            // failure is remembered per EDID id.
+            //
+            // Remembered, not final. "Did not answer" is not always a property
+            // of the monitor: one asleep at sign-in, behind a dock or KVM that
+            // is still enumerating, or switched to another input all fail the
+            // first probe and would then be written off as uncontrollable for
+            // the rest of the session -- no slider, and no way to get one back
+            // short of reloading the mod. So a failed verdict expires, on a
+            // delay that doubles each time, and a display that goes away drops
+            // its verdict entirely (below) so a replug starts over.
+            std::map<std::wstring, DdcVerdict>::const_iterator known =
                 ddcAnswered_.find(d.stableId);
+            const std::chrono::steady_clock::time_point now =
+                std::chrono::steady_clock::now();
+            bool probe = true;
+            if (known != ddcAnswered_.end() && !known->second.answered) {
+                probe = (now - known->second.taken) >=
+                        DdcRetryDelay(known->second.failures);
+            }
             bool attached = false;
-            if (known == ddcAnswered_.end() || known->second) {
+            if (probe) {
                 attached = TryAttachDdcCi(h, &d);
-                ddcAnswered_[d.stableId] = attached;
+                DdcVerdict& v = ddcAnswered_[d.stableId];
+                v.failures = attached ? 0 : v.failures + 1;
+                v.answered = attached;
+                v.taken = now;
             }
 
             if (attached) {
@@ -1086,6 +1152,20 @@ class Engine {
                       }
                       return a.rect.top < b.rect.top;
                   });
+
+        // A display that is gone takes its DDC/CI verdict with it, so
+        // unplugging and replugging a monitor that failed its first probe
+        // gets a fresh one rather than inheriting the old answer.
+        for (auto it = ddcAnswered_.begin(); it != ddcAnswered_.end();) {
+            bool present = false;
+            for (const Display& d : found) {
+                if (d.stableId == it->first) {
+                    present = true;
+                    break;
+                }
+            }
+            it = present ? std::next(it) : ddcAnswered_.erase(it);
+        }
 
         {
             std::lock_guard<std::mutex> lock(mutex_);
@@ -1198,8 +1278,15 @@ class Engine {
     std::thread worker_;
     std::thread eventThread_;
     std::map<std::wstring, std::chrono::steady_clock::time_point> lastRequest_;
+    // What a DDC/CI probe last said about a display, and when.
+    //
     // Worker thread only, so it needs no lock.
-    std::map<std::wstring, bool> ddcAnswered_;
+    struct DdcVerdict {
+        bool answered = false;
+        int failures = 0;
+        std::chrono::steady_clock::time_point taken{};
+    };
+    std::map<std::wstring, DdcVerdict> ddcAnswered_;
     FollowMode followMode_ = FollowMode::Off;
     std::atomic<bool> stopping_{false};
     std::mutex mutex_;

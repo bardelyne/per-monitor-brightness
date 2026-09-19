@@ -135,6 +135,14 @@ calling through what had been freed.
 pass ends in a fastfail (0xc0000409). A `DispatcherTimer` runs on the same XAML
 thread between passes and is fine.
 
+> Later note, and worth reading before relying on this one. It was measured
+> with the diagnostics connection open, and that connection's own retry loop
+> produces the identical `0xc0000409` for a completely unrelated reason (see
+> DEVELOPING.md, "Never run the TAP connection loop against a starting
+> shell"). The shipped mod has no TAP and does walk the tree from
+> `LayoutUpdated` on both of its retry paths, without reproducing this. Treat
+> the attribution as unproven rather than the fact as established.
+
 `OnGotFocus` avoids all four: it is a `produce<>` override, it runs after
 construction, and it is not inside layout.
 
