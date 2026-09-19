@@ -71,18 +71,82 @@ Two earlier conclusions died with the old signal and should not be cited:
 - It is not this mod's engine, threads, COM, WMI, DDC, or tree injection. The
   probe does none of those and still breaks the styler.
 
-## Where a fix could go
+## The fix, and what it took to land it
 
-The mod needs the TAP for one thing: to notice `ControlCenterView` appearing
-and to get onto the XAML thread. Both may be reachable without diagnostics --
-the mod already has a `WinEventProc` that sees the Control Center being shown,
-and `RunOnXamlThread` to get onto the right thread, from where
-`Window::Current().Content()` gives a tree that can be walked directly. If
-that works, the TAP can go, and with it the conflict.
+The TAP is gone. The mod now hooks a function in ControlCenter.dll and takes
+the Control Center element out of it, then walks the tree with the public
+`VisualTreeHelper` API -- what `explorer-command-bar` does, and for the reason
+it gives.
 
-That is a hypothesis, not a result. It needs the same treatment as everything
-above: build it in the probe first, measure it with the red-pixel signal, and
-re-run the control every time.
+The hook is:
+
+    winrt::impl::produce<ControlCenterView, IControlOverrides>::OnGotFocus
+
+Measured with the same red-pixel signal, control re-run each time:
+
+| run | red | styler |
+|---|---|---|
+| nothing loaded | 8050 | works |
+| probe with a TAP | 0 | **broken** |
+| probe, tapless | 8050 | works |
+| **real mod (ported) + styler** | **9470** | **works** |
+
+The last row is the one that answers the bug report: the per-monitor sliders
+and the styler's paint are both present in the same screenshot. Closing and
+reopening the flyout re-injects. Disabling the mod restores the stock slider
+and leaves ShellHost on the same pid.
+
+### The first idea was wrong, and the way it was wrong was instructive
+
+The plan recorded here was to reuse the existing `WinEventProc` and read the
+tree from `Window::Current().Content()`. The WinEvent fires exactly as hoped --
+`ControlCenterWindow`, on the XAML thread -- and `Window::Current()` is null
+there anyway. The window shown beside it says why:
+`Windows.UI.Composition.DesktopWindowContentBridge`. The Control Center is a
+XAML island, islands have no `CoreWindow`, and there is therefore no ambient
+`Window` to read a root from. That is the actual reason this mod reached for
+diagnostics in the first place, and no amount of care with the WinEvent hook
+would have changed it. The tree has to be entered from an element the host
+hands over.
+
+### Four things that each cost a measurement
+
+**Hooks registered outside `Wh_ModInit` are never armed.** `Wh_SetFunctionHook`
+only registers; Windhawk applies the registrations once, when `Wh_ModInit`
+returns. Five hooks set from a polling thread stayed silent in the very process
+that was showing the flyout, which looked exactly like "the class is not the
+live code path". A canary on an unrelated telemetry function -- silent too --
+is what separated a wrong target from an unarmed hook. Anything registered
+later needs `Wh_ApplyHookOperations()`.
+
+**Not every `this` is a COM pointer.** A `produce<>` override's `this` is an
+interface on the object and `copy_from_abi` is safe. An implementation member's
+`this` is not, and QueryInterface through it faulted ShellHost (0xc0000005),
+repeatedly, until Windows stopped restarting it. A try/catch does not save a
+call through a bad vtable.
+
+**`IComponentConnector::Connect` is too early.** It hands over the real element
+-- it was logged doing so -- but it runs inside `InitializeComponent`, and
+merely taking a reference there (copy_from_abi addrefs, the scope releases)
+destroyed the half-built view. ShellHost then faulted in no module at all,
+calling through what had been freed.
+
+**The tree cannot be walked from `LayoutUpdated`.** Doing it inside a layout
+pass ends in a fastfail (0xc0000409). A `DispatcherTimer` runs on the same XAML
+thread between passes and is fine.
+
+`OnGotFocus` avoids all four: it is a `produce<>` override, it runs after
+construction, and it is not inside layout.
+
+### Two smaller facts worth keeping
+
+`OnApplyTemplate` is never called on this class and hooking it proves nothing.
+`ControlCenterView` is compiled XAML with an `InitializeComponent`, so no
+`ControlTemplate` is ever applied and the override is dead code.
+
+The brightness slider's type is `ControlCenter.AsyncSlider`, not
+`Windows.UI.Xaml.Controls.Slider`. Searching the tree for the latter returns
+nothing, which reads identically to "the tree is not ready yet".
 
 ## This is a known limitation, and the ecosystem already documents it
 
@@ -135,11 +199,9 @@ TAP:
 It hooks the host's own code to learn when the element appears and then walks
 the tree with the public `VisualTreeHelper` API.
 
-That is the fix for this mod, and it needs no new machinery: `WinEventProc`
-already sees `EVENT_OBJECT_SHOW` for the Control Center, and `RunOnXamlThread`
-already gets onto the right thread, from where `Window::Current().Content()`
-gives a tree to walk. Dropping the TAP removes the conflict by construction
-rather than winning a fight over a single-consumer resource.
+That is what this mod now does. The details of which function to hook, and the
+several that cannot be, are above -- `Window::Current().Content()` is not among
+the options, because the Control Center is a XAML island.
 
 The alternative -- hook `InitializeXamlDiagnosticsEx` and arbitrate, as the two
 explorer stylers do -- would also work, but it means this mod deciding whether

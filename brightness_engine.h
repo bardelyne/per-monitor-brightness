@@ -63,9 +63,9 @@ struct Display {
     // EDID device instance path. HMONITOR is not stable, so it is never a key.
     std::wstring stableId;
     std::wstring name;           // "LS27F32xG", "Built-in display"
-    std::wstring gdiDeviceName;  // "\\.\DISPLAY5"
+    std::wstring gdiDeviceName;  // @harness-only  // "\\.\DISPLAY5"
     RECT rect{};
-    bool isPrimary = false;
+    bool isPrimary = false;  // @harness-only
     Transport transport = Transport::None;
     int percent = -1;  // last known, -1 if never read
 
@@ -272,8 +272,6 @@ class WmiSession {
         return true;
     }
 
-    bool Ok() const { return services_ != nullptr; }
-
     // Lets a long enumeration give up when the engine is shutting down.
     void SetStopFlag(const std::atomic<bool>* stopping) { stopping_ = stopping; }
 
@@ -443,9 +441,23 @@ class Engine {
 
     // Non-blocking. Repeated calls for the same display collapse into a single
     // hardware write, so a slider drag can never outrun the I2C bus.
+    // Setting a display explicitly -- the slider, or anything else the user
+    // drove -- is what re-bases relative following on that display. Note that
+    // a refresh deliberately does not: the hardware reports the clamped value,
+    // so re-basing on a read would throw away the very offset followRaw_
+    // exists to remember.
     void SetPercent(const std::wstring& stableId, int percent) {
+        SetPercentInternal(stableId, percent, /*rebaseFollow=*/true);
+    }
+
+   private:
+    void SetPercentInternal(const std::wstring& stableId, int percent,
+                            bool rebaseFollow) {
         {
             std::lock_guard<std::mutex> lock(mutex_);
+            if (rebaseFollow) {
+                followRaw_.erase(stableId);
+            }
             // Stamped on request, not on completion: a drag keeps refreshing
             // this, so the whole drag plus its trailing echoes stay covered.
             lastRequest_[stableId] = std::chrono::steady_clock::now();
@@ -460,6 +472,7 @@ class Engine {
         work_.notify_all();
     }
 
+   public:
     void RequestRescan() {
         {
             std::lock_guard<std::mutex> lock(mutex_);
@@ -487,9 +500,10 @@ class Engine {
         onChanged_ = std::move(fn);
     }
 
-    // Diagnostics for the standalone harness.
-    unsigned Writes() const { return writes_.load(); }
-    void ResetWrites() { writes_.store(0); }
+    // Diagnostics for the standalone harness. build_mod.sh strips these
+    // and everything else tagged @harness-only out of the mod.
+    unsigned Writes() const { return writes_.load(); }  // @harness-only
+    void ResetWrites() { writes_.store(0); }  // @harness-only
 
    private:
     static constexpr BYTE kVcpLuminance = 0x10;
@@ -509,11 +523,10 @@ class Engine {
     void WorkerMain() {
         HRESULT comHr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
 
-        // Deliberately no CoInitializeSecurity: it is process-wide and this
-        // thread starts from Wh_ModInit, before the host's own startup code
-        // runs, so we would likely win the race and impose our settings on the
-        // whole process. CoSetProxyBlanket on the IWbemServices proxy is what
-        // actually governs our WMI calls.
+        // Deliberately no CoInitializeSecurity: it is process-wide, so calling
+        // it would impose this thread's settings on the whole host.
+        // CoSetProxyBlanket on the IWbemServices proxy is what actually governs
+        // our WMI calls.
 
         // Created here, not as a plain member: these interface pointers belong
         // to this thread's apartment and must not outlive it. Releasing them
@@ -846,10 +859,34 @@ class Engine {
                         d.transport == Transport::None) {
                         continue;
                     }
-                    int base = (d.percent < 0) ? percent : d.percent;
-                    int want = (followMode_ == FollowMode::Match)
-                                   ? percent
-                                   : std::clamp(base + delta, 0, 100);
+
+                    int want;
+                    if (followMode_ == FollowMode::Match) {
+                        want = percent;
+                        // Nothing to accumulate in match mode, and leaving a
+                        // stale accumulator behind would make a later switch
+                        // back to relative jump.
+                        followRaw_.erase(d.stableId);
+                    } else {
+                        // Clamping the *stored* value destroys the offset this
+                        // mode exists to preserve: panel 50 -> 10 with a
+                        // monitor at 30 stores 0, and panel 10 -> 50 then
+                        // gives 40 rather than 30. Every trip to an end stop
+                        // used to shift that monitor permanently. So the
+                        // accumulator runs unclamped past the ends and only
+                        // what goes to the hardware is clamped.
+                        auto seen = followRaw_.find(d.stableId);
+                        int raw = (seen != followRaw_.end())
+                                      ? seen->second
+                                      : ((d.percent < 0) ? percent : d.percent);
+                        // Bounded so a long run against an end stop cannot
+                        // wander arbitrarily far and take many keypresses to
+                        // come back.
+                        raw = std::clamp(raw + delta, -100, 200);
+                        followRaw_[d.stableId] = raw;
+                        want = std::clamp(raw, 0, 100);
+                    }
+
                     if (want != d.percent) {
                         follow.emplace_back(d.stableId, want);
                     }
@@ -859,23 +896,37 @@ class Engine {
 
         Log(L"brightness event: %ls is now %d%%", instanceName.c_str(), percent);
 
-        // Outside the lock: SetPercent takes it.
+        // Outside the lock: SetPercentInternal takes it. Not the public
+        // SetPercent -- that re-bases following, which would erase the
+        // accumulator computed just above.
         for (const auto& entry : follow) {
-            SetPercent(entry.first, entry.second);
+            SetPercentInternal(entry.first, entry.second,
+                               /*rebaseFollow=*/false);
         }
 
         NotifyChanged(false);
     }
 
     void ReleasePhysicalMonitors() {
-        std::lock_guard<std::mutex> lock(mutex_);
-        for (auto& d : displays_) {
-            if (d.hPhysical) {
-                PHYSICAL_MONITOR pm{};
-                pm.hPhysicalMonitor = d.hPhysical;
-                DestroyPhysicalMonitors(1, &pm);
-                d.hPhysical = nullptr;
+        // The handles come out under the lock; the destroying happens without
+        // it. This is the same mutex the XAML thread takes in GetDisplays()
+        // and in SetPercent() from the slider's ValueChanged, so holding it
+        // across DestroyPhysicalMonitors let a slow monitor teardown during a
+        // rescan stall the shell's UI thread.
+        std::vector<HANDLE> handles;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            for (auto& d : displays_) {
+                if (d.hPhysical) {
+                    handles.push_back(d.hPhysical);
+                    d.hPhysical = nullptr;
+                }
             }
+        }
+        for (HANDLE h : handles) {
+            PHYSICAL_MONITOR pm{};
+            pm.hPhysicalMonitor = h;
+            DestroyPhysicalMonitors(1, &pm);
         }
     }
 
@@ -962,9 +1013,9 @@ class Engine {
             }
 
             Display d;
-            d.gdiDeviceName = mi.szDevice;
+            d.gdiDeviceName = mi.szDevice;  // @harness-only
             d.rect = mi.rcMonitor;
-            d.isPrimary = (mi.dwFlags & MONITORINFOF_PRIMARY) != 0;
+            d.isPrimary = (mi.dwFlags & MONITORINFOF_PRIMARY) != 0;  // @harness-only
 
             DISPLAY_DEVICEW dd{};
             dd.cb = sizeof(dd);
@@ -1038,6 +1089,20 @@ class Engine {
 
         {
             std::lock_guard<std::mutex> lock(mutex_);
+            // Drop accumulators for displays that are no longer here, so a
+            // monitor that comes back does not inherit an offset from an
+            // earlier session of itself.
+            for (auto it = followRaw_.begin(); it != followRaw_.end();) {
+                bool present = false;
+                for (const auto& d : found) {
+                    if (d.stableId == it->first) {
+                        present = true;
+                        break;
+                    }
+                }
+                it = present ? std::next(it) : followRaw_.erase(it);
+            }
+
             displays_ = std::move(found);
         }
     }
@@ -1122,7 +1187,7 @@ class Engine {
         long long ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                            std::chrono::steady_clock::now() - start)
                            .count();
-        writes_.fetch_add(1);
+        writes_.fetch_add(1);  // @harness-only
         // Unconditional: Windhawk's own per-mod logging switch already gates
         // whether any of this is emitted, and it is off by default.
         Log(L"apply %ls -> %d%% ok=%d (%lld ms)", stableId.c_str(), percent,
@@ -1141,10 +1206,14 @@ class Engine {
     std::condition_variable work_;
     std::condition_variable ready_;
     std::map<std::wstring, int> pending_;
+
+    // Where relative following thinks each display would be if brightness had
+    // no end stops. Guarded by mutex_.
+    std::map<std::wstring, int> followRaw_;
     std::vector<Display> displays_;
     std::unique_ptr<WmiSession> wmi_;
     LogFn log_ = nullptr;
-    std::atomic<unsigned> writes_{0};
+    std::atomic<unsigned> writes_{0};  // @harness-only
     std::function<void(bool)> onChanged_;
     bool quit_ = false;
     bool rescan_ = false;
