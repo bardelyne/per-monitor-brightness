@@ -83,3 +83,65 @@ that works, the TAP can go, and with it the conflict.
 That is a hypothesis, not a result. It needs the same treatment as everything
 above: build it in the probe first, measure it with the red-pixel signal, and
 re-run the control every time.
+
+## This is a known limitation, and the ecosystem already documents it
+
+Searching the whole mod catalogue (611 mods) for `InitializeXamlDiagnosticsEx`
+returns seven, and reading them settles both the mechanism and the remedy.
+
+`windows-11-taskbar-styler`, in its own README:
+
+> This mod uses XAML diagnostics to inspect and customize the taskbar. However,
+> there can only be one XAML diagnostics consumer at a time. If another program
+> (such as ExplorerBlurMica or TranslucentTB) tries to use XAML diagnostics
+> while this mod is running, there will be a conflict.
+
+So the probe result is not a discovery about this mod -- it is the documented
+behaviour of the platform.
+
+### Who shares a process, and what they do about it
+
+| mod | process | `InitializeXamlDiagnosticsEx` |
+|---|---|---|
+| taskbar-styler | explorer.exe | **hooks it**, setting `xamlDiagnosticsHandling` |
+| file-explorer-styler | explorer.exe | **hooks it**, setting `xamlDiagnosticsHandling` |
+| cjk-spacer | explorer.exe | only calls it (its XAML path is opt-in, and says why) |
+| explorer-command-bar | explorer.exe | **does not use it at all** |
+| notification-center-styler | ShellHost.exe | only calls it |
+| start-menu-styler | StartMenuExperienceHost / SearchHost | only calls it |
+| settings-styler | SystemSettings.exe | only calls it |
+
+The two mods that had to share a process are exactly the two that hook the
+function and offer alert / block / allow. Every other one sits in a process of
+its own and never had to. The notification-center styler has no such defence,
+because until now nothing else used diagnostics in `ShellHost.exe` -- this mod
+is the first, and it takes the connection without asking.
+
+The CLSID pattern falls out of the same thing: one id is reused across
+styler mods that never meet, and `taskbar-styler` alone carries its own,
+because it alone shares a process with another styler. That is hygiene, not
+the mechanism -- the probe has a unique CLSID and still breaks the styler.
+
+### The remedy the ecosystem chose
+
+`explorer-command-bar` is the newest of the seven and deliberately refuses the
+TAP:
+
+> XAML Diagnostics (InitializeXamlDiagnosticsEx) would be an easier way to
+> watch for the command bar, but only one XAML diagnostics consumer can be
+> active per process, which makes it conflict with other tools and mods, such
+> as Windows 11 File Explorer Styler. That's why it's not used here.
+
+It hooks the host's own code to learn when the element appears and then walks
+the tree with the public `VisualTreeHelper` API.
+
+That is the fix for this mod, and it needs no new machinery: `WinEventProc`
+already sees `EVENT_OBJECT_SHOW` for the Control Center, and `RunOnXamlThread`
+already gets onto the right thread, from where `Window::Current().Content()`
+gives a tree to walk. Dropping the TAP removes the conflict by construction
+rather than winning a fight over a single-consumer resource.
+
+The alternative -- hook `InitializeXamlDiagnosticsEx` and arbitrate, as the two
+explorer stylers do -- would also work, but it means this mod deciding whether
+to break somebody else's, which is a worse position to put a user in when the
+mod does not need diagnostics in the first place.
