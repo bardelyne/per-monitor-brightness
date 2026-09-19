@@ -1602,9 +1602,18 @@ namespace {
 [[clang::no_destroy]] winrt::com_ptr<VisualTreeWatcher> g_visualTreeWatcher;
 }
 
-// {C85D8CC7-5463-40E8-A432-F5916B6427E5}
+// {F4335B68-660D-45D5-AD90-5F4104FAA72C}
+//
+// Must be this mod's own, not the one from the styler this plumbing was
+// adapted from. Two mods in one process registering the same CLSID collide:
+// XAML loads each TAP DLL by path but resolves the class through the
+// process-wide COM class table, so whichever registers first answers for
+// both, and the second mod's TAP object is never created -- its visual tree
+// watcher never runs and it silently does nothing. That is what stopped the
+// Notification Center Styler theming the Control Center whenever this mod
+// was enabled.
 static constexpr CLSID CLSID_WindhawkTAP = {
-    0xc85d8cc7, 0x5463, 0x40e8, {0xa4, 0x32, 0xf5, 0x91, 0x6b, 0x64, 0x27, 0xe5}};
+    0xf4335b68, 0x660d, 0x45d5, {0xad, 0x90, 0x5f, 0x41, 0x04, 0xfa, 0xa7, 0x2c}};
 
 class WindhawkTAP : public winrt::implements<WindhawkTAP, IObjectWithSite,
                                              winrt::non_agile> {
