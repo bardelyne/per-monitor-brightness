@@ -79,10 +79,25 @@ list.
 
 ## Debugging
 
-Turn on **Verbose logging** in the mod settings and watch the output with
-DebugView or similar. Every hardware write is logged with its transport, value,
-success flag and duration, which is usually enough to tell a misbehaving monitor
-from a mistake in the mod.
+Turn logging on for the mod (Windhawk's mod settings, or `LoggingEnabled=1`
+under `HKLM\SOFTWARE\Windhawk\Engine\Mods\<id>` plus a `SettingsChangeTime`
+bump) and read the output **in Windhawk's own log window**.
+
+DebugView will not work, and this is worth knowing before spending an hour on
+it. `Wh_Log` is `OutputDebugString` underneath, and the Windhawk *service* owns
+`Global\DBWIN_BUFFER_READY` for as long as it runs — that is how the log
+window gets its content. A second listener creates the objects with
+`ERROR_ALREADY_EXISTS`, reports itself as listening, and then receives nothing,
+because the events are auto-reset and the service is always waiting on them.
+Stopping the tray process does not help; the service is the owner. Verified by
+emitting a canary from another process and watching both listeners.
+
+If you need log output somewhere a script can read it, write to a file from the
+mod rather than trying to tap the debug channel.
+
+Every hardware write is logged with its transport, value, success flag and
+duration, which is usually enough to tell a misbehaving monitor from a mistake
+in the mod.
 
 ## Things that cost real time
 
@@ -94,12 +109,67 @@ documented anywhere obvious.
 And it is **not** an AppContainer — medium integrity, so the mod can call
 `dxva2` and WMI directly in-process. No helper process needed.
 
-### Injection timing
+### How long a `ControlCenterView` actually lives
 
-The Control Center tree is built once at shell start and then merely shown and
-hidden. There is no "opened" event on the element. Waiting on `LayoutUpdated`
-means waiting until the panel is next *closed*. Inject as soon as the visual
-tree reports `ControlCenterView`.
+Neither "built once at shell start" nor "rebuilt on every open", and this mod
+has at different times believed both.
+
+It is built the first time Quick Settings is shown and then kept, shown and
+hidden, across subsequent opens — which is why the second open is instant, and
+why a view that is being kept runs no layout while it sits open, so waiting on
+`LayoutUpdated` means waiting until the panel is next *closed*. Leave it closed
+for a while and the shell discards it; the next open constructs a new one.
+
+That last part is the whole of the "flicker if I have not opened it in a while,
+none if I just did" report. It also means injection bookkeeping has to prune
+trees the shell has torn down rather than assume one view forever.
+
+There is no "opened" event on the element, so inject as soon as the view is
+reported and treat `Loaded`/`LayoutUpdated` as retries.
+
+### Only one XAML diagnostics consumer per process
+
+This is the single most important thing to know before changing how the mod
+finds the Control Center, and it is documented upstream in the Windows 11
+Taskbar Styler's own readme rather than by Microsoft.
+
+The mod used to find `ControlCenterView` through an XAML diagnostics TAP. It
+worked, and it quietly broke the Windows 11 Notification Center Styler, which
+wants the same slot in the same process: whichever mod connects second gets
+nothing and says nothing. A user reported it as "your mod stops my theming",
+which is exactly right.
+
+So discovery is a symbol hook now, the way `explorer-command-bar` does it: hook
+a function in the host's own DLL, take the element from the arguments, and walk
+the tree with the public `VisualTreeHelper`. No slot to contend for. The
+conflict is gone by construction rather than by cooperation, and the `probe/`
+directory has the experiment that proved both halves of it.
+
+Two things the replacement needs that the TAP did not:
+
+- **The pointer must really be a COM interface on the view.** A `produce<>`
+  override's `this` is. An implementation member's `this` is not, and
+  `QueryInterface` through it faults the host. `copy_from_abi` does **not** QI
+  -- it addrefs and stores the pointer as-is -- so it is the wrong tool here
+  even though the happy path hides that.
+- **Symbol hooks registered outside `Wh_ModInit` are not armed.** Windhawk
+  applies what `Wh_ModInit` registers, once, when it returns. Anything
+  registered later -- from inside a `LoadLibraryExW` hook, say -- sits there
+  doing nothing until `Wh_ApplyHookOperations()` is called by hand. Five hooks,
+  including a canary that had nothing to do with the view, stayed silent in the
+  very process that was showing the flyout.
+
+### Hook kernelbase's `LoadLibraryExW`, not kernel32's
+
+kernel32's export is a forwarder. The WinRT activation path that maps
+`ControlCenter.dll` calls kernelbase directly, so a hook on kernel32 never sees
+the load — which is the kind of thing that sends you off building a polling
+thread to work around it.
+
+Also: resolve the module with `GetModuleHandleW` afterwards rather than
+trusting the returned handle. `LOAD_LIBRARY_AS_DATAFILE` and friends, which
+resource lookups use, return a mapping that is not executable code and is never
+in the loader's module list.
 
 ### `RowDefinition` needs a strong reference
 
@@ -168,10 +238,21 @@ What makes this hard to find:
   `abort()`. Always read the subcode.
 - Nothing throws, so exception guards catch nothing and prove nothing.
 
-The fix is to do no COM until the host is up. This mod starts the engine from
-`StartEngineIfNeeded`, called once a XAML window exists in the process -- the
-same condition the TAP injection already waited for. Enumeration then blocks
-harmlessly, because the host is no longer waiting on us.
+The fix is to do no COM until the host is up. The gate used to be "a XAML
+window exists in the process", which is the condition the TAP injection already
+waited for. It is now "a Control Center exists in this process" -- the engine
+starts from the `ControlCenter.dll` discovery hook, or from the view's
+`Connect`/`OnGotFocus`, whichever fires first. Tighter in both directions: a
+process that hosts XAML but never a Control Center pays nothing, and the engine
+is warm before the first open instead of enumerating while the flyout is
+already on screen.
+
+One consequence worth keeping in mind if the host ever changes. "ControlCenter.dll
+is mapped at `Wh_ModInit`" means "the mod was enabled into a running shell"
+only because ShellHost does not statically import it. If a future build does,
+that would be true on every cold start and the old race is back, so the
+already-mapped path checks whether the process yet owns a top-level window
+before warming the engine.
 
 If you need to find something like this again, bisect rather than theorise: put
 a temporary bitmask setting in the mod that switches subsystems off, then drive
@@ -187,6 +268,12 @@ on the host and making its own call fail `RPC_E_TOO_LATE`. `CoSetProxyBlanket` o
 the specific proxy is what actually governs your calls.
 
 ### Never run the TAP connection loop against a starting shell
+
+This mod no longer opens a diagnostics connection at all (see above), so none
+of this is in the source any more. It is kept because the failure is generic to
+mods that do, and because its fault code is easy to misattribute -- including
+by this project, which recorded an unrelated "cannot walk the tree from
+`LayoutUpdated`" constraint that was probably this.
 
 `InitializeXamlDiagnosticsEx` is called in a loop over `VisualDiagConnection1`,
 `2`, ... because there is no way to ask which diagnostics slot is free. That is

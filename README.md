@@ -41,7 +41,14 @@ silently dropped.
 | Setting | Default | Effect |
 |---|---|---|
 | Hide the built-in brightness slider | on | Collapses the stock row, which only controls the internal panel |
-| Laptop brightness keys control every monitor | `relative` | `relative` shifts others by the same delta, preserving their offsets; `match` sets them all equal; `off` disables |
+| Laptop brightness keys control every monitor | `off` | `relative` shifts others by the same delta, preserving their offsets; `match` sets them all equal |
+
+The second one is off by default because Windows raises the same signal for a
+brightness key, for the power plan's AC and battery levels, and for idle
+dimming, with no way to tell them apart — so with it on, unplugging the charger
+would also write to every external monitor. Unlike everything else this mod
+does, that write is not undone by turning the setting off or disabling the mod:
+the monitor stores the value itself.
 
 ## Limitations
 
@@ -52,9 +59,15 @@ silently dropped.
 - DDC/CI has no notification channel: a monitor only ever answers what the host
   asks it. Brightness changed using the monitor's own buttons cannot be
   detected, and only shows up the next time the panel is opened.
-- Not every monitor implements DDC/CI correctly. If one does not respond,
-  enable logging for the mod in Windhawk's settings and check whether its
-  writes report `ok=0`.
+- Not every monitor implements DDC/CI correctly. One that does not answer at
+  all is listed as uncontrollable and gets no slider; one that answers but
+  misbehaves shows up as writes reporting `ok=0`, which you can see by enabling
+  logging for the mod in Windhawk's settings.
+- A monitor that was asleep, switched to another input, or behind a dock still
+  enumerating when you signed in will fail that first check. It is retried
+  rather than written off: opening the panel again re-probes it, backing off
+  from 30 seconds to at most 16 minutes between attempts, and unplugging and
+  replugging it starts over immediately.
 
 ## Installing
 
