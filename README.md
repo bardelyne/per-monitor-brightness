@@ -76,7 +76,16 @@ undocumented platform behaviour this relies on.
 
 ## Licence
 
-GPLv3. The XAML-diagnostics plumbing (`VisualTreeWatcher` / `WindhawkTAP` /
-`InjectWindhawkTAP`) is adapted from m417z's
+GPLv3, and adapted in part from m417z's
 [Windows 11 Notification Center Styler](https://github.com/ramensoftware/windhawk-mods/blob/main/mods/windows-11-notification-center-styler.wh.cpp),
 which is GPLv3.
+
+What is borrowed has changed. This mod used to carry that mod's
+XAML-diagnostics plumbing — `VisualTreeWatcher`, `WindhawkTAP`,
+`InjectWindhawkTAP` — and none of it is here any more: XAML diagnostics allows
+one consumer per process, so holding the slot stopped that very mod theming the
+Control Center. Discovery is a symbol hook now.
+
+What remains adapted is the synchronous hop onto the XAML thread in
+`RunOnXamlThread`: a `WH_CALLWNDPROC` hook plus `SendMessage` of a registered
+message, which is the approach behind its `RunFromWindowThread`.
