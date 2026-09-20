@@ -8,6 +8,7 @@
 | `mod_template.cpp` | The mod source: UI injection, settings, Win32 listeners. |
 | `brightness_engine.h` | The brightness engine. Independently testable, no UI or Windhawk dependency. |
 | `engine_test.cpp` | Standalone harness for the engine. |
+| `stage_test.cpp` | Single-threaded bisect of the engine's dependencies: COM, WMI and DDC/CI in order, each step printed unbuffered. What told the startup crash apart from a threading bug. |
 | `build_mod.sh` | Splices the engine into the template to produce the `.wh.cpp`. |
 | `install_mod.sh` | Compiles and installs the mod without the Windhawk GUI, then hot-reloads it. Needs an elevated shell. |
 
@@ -45,6 +46,13 @@ INC="/c/Program Files/Windhawk/Compiler/include"
   engine_test.cpp -o engine_test.exe \
   -ldxva2 -lole32 -loleaut32 -lwbemuuid -luuid -lgdi32 -luser32 -static
 ```
+
+`stage_test.cpp` builds with that same line. Reach for it when the
+engine takes a process down and the stack says nothing useful: it makes
+the same COM, WMI and DDC/CI calls the engine does, one at a time on one
+thread, printing before each one with the buffer off. The last line
+printed is the call that did it, and building it at both `-O0` and `-O2`
+separates a real fault from an optimiser artefact.
 
 `__USE_MINGW_ANSI_STDIO=0` is not optional. Without it, `%s` in a **wide**
 `printf` means a *narrow* string and passing `wchar_t*` walks off into garbage.
