@@ -8,6 +8,7 @@
 | `mod_template.cpp` | The mod source: UI injection, settings, Win32 listeners. |
 | `brightness_engine.h` | The brightness engine. Independently testable, no UI or Windhawk dependency. |
 | `engine_test.cpp` | Standalone harness for the engine. |
+| `probe/layout-probe.wh.cpp` | Read-only dump of where the native slider group sits in `L1Grid`. What the panel-position setting was designed against. |
 | `stage_test.cpp` | Single-threaded bisect of the engine's dependencies: COM, WMI and DDC/CI in order, each step printed unbuffered. What told the startup crash apart from a threading bug. |
 | `build_mod.sh` | Splices the engine into the template to produce the `.wh.cpp`. |
 | `install_mod.sh` | Compiles and installs the mod without the Windhawk GUI, then hot-reloads it. Needs an elevated shell. |

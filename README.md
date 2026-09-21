@@ -35,11 +35,16 @@ silently dropped.
 - Values re-read whenever the panel opens, catching changes made elsewhere.
 - The stock brightness slider can be hidden, since it duplicates the internal
   panel's row.
+- The sliders sit with the Windows ones by default, and can be moved above them
+  or down to the bottom of the flyout.
+- Displays that cannot be controlled can be hidden.
 
 ## Settings
 
 | Setting | Default | Effect |
 |---|---|---|
+| Where to put the sliders | `belowSliders` | Joins the card holding the volume and stock brightness rows. `aboveSliders` puts it first in that card; `bottom` is under the settings button, outside the card, as before 2.1 |
+| Hide displays that cannot be controlled | off | Leaves out displays that answer neither transport. They are still re-checked, so one that starts answering appears |
 | Hide the built-in brightness slider | on | Collapses the stock row, which only controls the internal panel |
 | Laptop brightness keys control every monitor | `off` | `relative` shifts others by the same delta, preserving their offsets; `match` sets them all equal |
 

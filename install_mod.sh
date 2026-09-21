@@ -10,14 +10,14 @@ ENGDIR="/c/Program Files/Windhawk/Engine/1.7.3/64"
 MODS="/c/ProgramData/Windhawk/Engine/Mods/64"
 SRCDIR="/c/ProgramData/Windhawk/ModsSource"
 
-NAME="local@per-monitor-brightness_2.0_9$(date +%H%M%S).dll"
+NAME="local@per-monitor-brightness_2.1_9$(date +%H%M%S).dll"
 
 "$CXX" --target=x86_64-w64-mingw32 -shared -O2 -std=c++23 \
   -DUNICODE -D_UNICODE -mwindows \
   -DWINVER=0x0A00 -D_WIN32_WINNT=0x0A00 \
   -D_WIN32_IE=0x0A00 -DNTDDI_VERSION=0x0A000008 \
   -D__USE_MINGW_ANSI_STDIO=0 -DWH_MOD \
-  '-DWH_MOD_ID=L"local@per-monitor-brightness"' '-DWH_MOD_VERSION=L"2.0"' \
+  '-DWH_MOD_ID=L"local@per-monitor-brightness"' '-DWH_MOD_VERSION=L"2.1"' \
   -include windhawk_api.h -I"$INC" \
   -L"$ENGDIR" \
   -Wl,--export-all-symbols \
