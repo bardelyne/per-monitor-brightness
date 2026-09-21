@@ -159,6 +159,50 @@ std::wstring Capability(wux::DependencyObject const& obj) {
     return L"(other)";
 }
 
+// Where an element actually sits, in the coordinates of a common ancestor.
+//
+// Margins and widths do not answer "do these two rows line up?" -- the answer
+// depends on every container in between. An absolute offset does, and it is
+// the only way to compare a row built by the mod against one built by the
+// shell without counting pixels in a screenshot.
+wux::FrameworkElement g_origin{nullptr};
+
+std::wstring Geo(wux::FrameworkElement const& fe) {
+    wchar_t buf[128];
+    try {
+        if (g_origin) {
+            auto transform = fe.TransformToVisual(g_origin);
+            auto point = transform.TransformPoint({0, 0});
+            swprintf(buf, 128, L"  @(%.0f,%.0f)..(%.0f,%.0f)", point.X, point.Y,
+                     point.X + fe.ActualWidth(), point.Y + fe.ActualHeight());
+            return buf;
+        }
+    } catch (...) {
+    }
+    return L"";
+}
+
+// Every descendant of `root` whose class contains `needle`, with geometry.
+// The full 16-deep dump of a native row is mostly slider-template plumbing;
+// this picks out the two elements whose positions the mod has to match.
+void FindAllByClass(wux::DependencyObject const& root, std::wstring_view needle,
+                    int maxDepth) {
+    if (maxDepth < 0) {
+        return;
+    }
+    std::wstring label = ElementLabel(root);
+    if (label.find(needle) != std::wstring::npos) {
+        if (auto fe = root.try_as<wux::FrameworkElement>()) {
+            Rec(L"    %s%s", label.c_str(), Geo(fe).c_str());
+        }
+    }
+    int count = wuxm::VisualTreeHelper::GetChildrenCount(root);
+    for (int i = 0; i < count; ++i) {
+        FindAllByClass(wuxm::VisualTreeHelper::GetChild(root, i), needle,
+                       maxDepth - 1);
+    }
+}
+
 void DumpTree(wux::DependencyObject const& root, int depth, int maxDepth) {
     if (depth > maxDepth) {
         return;
@@ -177,7 +221,7 @@ void DumpTree(wux::DependencyObject const& root, int depth, int maxDepth) {
                  wuxc::Grid::GetColumn(fe), fe.ActualWidth(),
                  fe.ActualHeight(), fe.Height(), fe.Margin().Left,
                  fe.Margin().Top, fe.Margin().Right, fe.Margin().Bottom);
-        extra = buf;
+        extra = std::wstring{buf} + Geo(fe);
     }
     Rec(L"%s%s%s", indent.c_str(), ElementLabel(root).c_str(), extra.c_str());
 
@@ -203,6 +247,7 @@ void Report(wux::DependencyObject const& view) try {
         return;
     }
     auto l1Grid = l1.as<wuxc::Grid>();
+    g_origin = l1Grid;
 
     Rec(L"");
     Rec(L"--- L1Grid: %u row(s), %u direct child(ren) ---",
@@ -279,6 +324,16 @@ void Report(wux::DependencyObject const& view) try {
     // contain a "GridView#RootGridView", and a depth-first search from L1Grid
     // reaches the toggles' one first -- it dumps 96x88 tiles and looks like a
     // plausible answer, which is the worst kind of wrong.
+    // The two things a matching row has to line up with.
+    Rec(L"");
+    if (group) {
+        Rec(L"--- native row internals (what our rows must match) ---");
+        Rec(L"  icons:");
+        FindAllByClass(group, L"AnimatedIcon", 30);
+        Rec(L"  sliders:");
+        FindAllByClass(group, L"Slider", 30);
+    }
+
     Rec(L"");
     if (group) {
         if (auto rootGridView = FindDescendant(
@@ -289,6 +344,19 @@ void Report(wux::DependencyObject const& view) try {
             Rec(L"--- no RootGridView under SlidersGroup ---");
             DumpTree(group, 0, 6);
         }
+    }
+    // The mod's own panel, in the same coordinates, so the two can be lined
+    // up by subtraction instead of by eye. Needs the mod enabled alongside
+    // this probe -- Windhawk chains symbol hooks, so both can run.
+    Rec(L"");
+    if (auto ours = FindDescendant(
+            l1Grid,
+            L"Windows.UI.Xaml.Controls.StackPanel#WindhawkPerMonitorBrightness",
+            6)) {
+        Rec(L"--- the mod's panel, 6 deep ---");
+        DumpTree(ours, 0, 6);
+    } else {
+        Rec(L"--- the mod's panel is not in the tree (is the mod enabled?) ---");
     }
     Rec(L"=== end ===");
 } catch (...) {

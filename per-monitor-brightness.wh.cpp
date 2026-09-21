@@ -1690,6 +1690,27 @@ struct Injection {
     int originalCardRowSpan = 0;
 };
 
+// Where the shell puts the parts of a slider row, so ours can go in the same
+// places.
+//
+// Measured rather than hardcoded, because these are somebody else's layout
+// constants and the only thing keeping them true is that nobody has changed
+// them. The defaults are what 26200 reports and are used when the native rows
+// cannot be measured -- which is normal, not exceptional: the rows are
+// virtualized, and injection happens early enough that they are often not
+// realized yet.
+struct SliderMetrics {
+    double iconLeft = 22;
+    double sliderLeft = 56;
+    double sliderRight = 300;
+    double groupWidth = 358;
+    double rowHeight = 40;
+    bool measured = false;
+};
+
+// XAML thread only, like everything else that touches the tree.
+SliderMetrics g_metrics;
+
 bool g_hideStockBrightness = true;
 
 // A display that answers nothing is listed by default, because a monitor that
@@ -1882,6 +1903,29 @@ wux::DependencyObject FindDescendantByName(wux::DependencyObject const& root,
     for (int i = 0; i < count; ++i) {
         auto child = wuxm::VisualTreeHelper::GetChild(root, i);
         if (auto found = FindDescendantByName(child, name, maxDepth - 1)) {
+            return found;
+        }
+    }
+    return nullptr;
+}
+
+// FindDescendant by exact label cannot find either of the elements the
+// layout has to be measured from: the shell's slider is
+// `ControlCenter.AsyncSlider`, not a `Windows.UI.Xaml.Controls.Slider`, and
+// its icon carries a name on one row and not on the next.
+wux::DependencyObject FindDescendantByClassSubstring(
+    wux::DependencyObject const& root, std::wstring_view needle, int maxDepth) {
+    if (maxDepth < 0) {
+        return nullptr;
+    }
+    if (ElementLabel(root).find(needle) != std::wstring::npos) {
+        return root;
+    }
+    int count = wuxm::VisualTreeHelper::GetChildrenCount(root);
+    for (int i = 0; i < count; ++i) {
+        if (auto found = FindDescendantByClassSubstring(
+                wuxm::VisualTreeHelper::GetChild(root, i), needle,
+                maxDepth - 1)) {
             return found;
         }
     }
@@ -2159,7 +2203,12 @@ void PopulateSliderPanel(wuxc::StackPanel const& panel, Injection& injection) {
 
         wux::FrameworkElement icon = MakeBrightnessIcon();
         icon.VerticalAlignment(wux::VerticalAlignment::Center);
-        icon.Margin(wux::ThicknessHelper::FromLengths(0, 0, 12, 0));
+        // The gap the shell leaves between its icon and its track, derived
+        // rather than guessed: the panel already starts at the icon's left
+        // edge, so what is left over after the icon is the gap.
+        icon.Margin(wux::ThicknessHelper::FromLengths(
+            0, 0,
+            g_metrics.sliderLeft - g_metrics.iconLeft - icon.Width(), 0));
         wuxc::Grid::SetColumn(icon, 0);
         sliderRow.Children().Append(icon);
 
@@ -2169,6 +2218,10 @@ void PopulateSliderPanel(wuxc::StackPanel const& panel, Injection& injection) {
         slider.Value(shownPercent);
         slider.IsThumbToolTipEnabled(true);
         slider.VerticalAlignment(wux::VerticalAlignment::Center);
+        // Matched to the shell's row so the track sits at the same height and
+        // the hit target is the same size. The default template is shorter,
+        // which reads as a thinner, flimsier control next to the real ones.
+        slider.Height(g_metrics.rowHeight);
         wuxc::Grid::SetColumn(slider, 1);
 
         SetIconLevel(icon, slider.Value());
@@ -2221,7 +2274,14 @@ wuxc::StackPanel BuildSliderPanel(Injection& injection) {
     wuxc::StackPanel panel;
     panel.Name(L"WindhawkPerMonitorBrightness");
     panel.Orientation(wuxc::Orientation::Vertical);
-    panel.Margin(wux::ThicknessHelper::FromLengths(16, 4, 16, 8));
+    // Left and right come from the native row so the icon column and the far
+    // end of the track line up with it; the panel used to be 6px left of the
+    // icons and 42px past the end of the sliders. Top and bottom are a group
+    // gap rather than a row gap -- these rows carry titles and are not
+    // pretending to be part of the same list.
+    panel.Margin(wux::ThicknessHelper::FromLengths(
+        g_metrics.iconLeft, 8, g_metrics.groupWidth - g_metrics.sliderRight,
+        8));
     PopulateSliderPanel(panel, injection);
     return panel;
 }
@@ -2444,6 +2504,73 @@ int PlacePanelRow(wuxc::Grid const& grid, Injection& injection) {
     return wantedRow;
 }
 
+
+// The first realized native slider, and the icon sharing its row.
+void MeasureNativeSliderMetrics(wux::FrameworkElement const& l1Grid) try {
+    auto group = FindDescendant(
+        l1Grid, L"Windows.UI.Xaml.Controls.ContentControl#SlidersGroup", 6);
+    if (!group) {
+        return;
+    }
+    auto groupFe = group.try_as<wux::FrameworkElement>();
+    if (!groupFe || groupFe.ActualWidth() <= 0) {
+        return;
+    }
+
+    // Any slider row will do. The brightness one is the obvious candidate and
+    // the wrong choice: it is absent on a desktop, and this mod hides it by
+    // default on a laptop, so the volume row is usually the only one left.
+    auto slider = FindDescendantByClassSubstring(group, L"AsyncSlider", 30);
+    if (!slider) {
+        return;
+    }
+    auto sliderFe = slider.try_as<wux::FrameworkElement>();
+    if (!sliderFe || sliderFe.ActualWidth() <= 0) {
+        return;
+    }
+
+    auto row = FindAncestorOfClass(
+        slider, L"Windows.UI.Xaml.Controls.GridViewItem", 24);
+    auto icon = row ? FindDescendantByClassSubstring(row, L"AnimatedIcon", 24)
+                    : nullptr;
+
+    SliderMetrics measured;
+    measured.groupWidth = groupFe.ActualWidth();
+
+    auto point = sliderFe.TransformToVisual(l1Grid).TransformPoint({0, 0});
+    measured.sliderLeft = point.X;
+    measured.sliderRight = point.X + sliderFe.ActualWidth();
+    measured.rowHeight = sliderFe.ActualHeight();
+
+    if (auto iconFe = icon ? icon.try_as<wux::FrameworkElement>() : nullptr) {
+        measured.iconLeft =
+            iconFe.TransformToVisual(l1Grid).TransformPoint({0, 0}).X;
+    } else {
+        // Keep the gap the default describes rather than inventing one.
+        measured.iconLeft = measured.sliderLeft - 34;
+    }
+
+    // A row that measures as nonsense is worse than the defaults.
+    if (measured.sliderRight <= measured.sliderLeft ||
+        measured.iconLeft < 0 || measured.iconLeft >= measured.sliderLeft ||
+        measured.sliderRight > measured.groupWidth || measured.rowHeight < 16) {
+        Wh_Log(L"Native slider metrics look wrong (icon %.0f slider %.0f..%.0f "
+               L"of %.0f, h %.0f); keeping the defaults",
+               measured.iconLeft, measured.sliderLeft, measured.sliderRight,
+               measured.groupWidth, measured.rowHeight);
+        return;
+    }
+
+    measured.measured = true;
+    g_metrics = measured;
+    Wh_Log(L"Native slider row: icon at %.0f, slider %.0f..%.0f of %.0f, "
+           L"height %.0f",
+           g_metrics.iconLeft, g_metrics.sliderLeft, g_metrics.sliderRight,
+           g_metrics.groupWidth, g_metrics.rowHeight);
+} catch (...) {
+    Wh_Log(L"Measuring the native slider row threw: %08X", winrt::to_hresult());
+}
+
 bool InjectInto(wux::FrameworkElement const& l1Grid) {
     auto grid = l1Grid.try_as<wuxc::Grid>();
     if (!grid) {
@@ -2482,6 +2609,9 @@ bool InjectInto(wux::FrameworkElement const& l1Grid) {
     // Before building the panel: the icons need the shell's Lottie, and it has
     // to be read while the stock row is still visible.
     TryCaptureBrightnessSource(l1Grid);
+
+    // Likewise before building: the rows are laid out from these.
+    MeasureNativeSliderMetrics(l1Grid);
 
     Injection injection;
     wuxc::StackPanel panel = BuildSliderPanel(injection);
