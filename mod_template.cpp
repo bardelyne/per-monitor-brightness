@@ -397,6 +397,21 @@ struct Injection {
     int originalCardRowSpan = 0;
 };
 
+// Where the panel goes. Declared up here because the row layout depends on
+// it: only one of the positions is drawn to match the shell's own rows.
+//
+// L1Grid holds the toggles in row 0, the native sliders in row 1 and the
+// footer in row 2, and the card behind the first two is a Border spanning
+// rows 0-1 -- so "with the native sliders" means taking a row inside that
+// span and pushing what follows down, while "at the bottom" means a row after
+// everything and outside the card.
+enum class PanelPosition {
+    AboveSliders,
+    BelowSliders,
+    Bottom,
+};
+PanelPosition g_panelPosition = PanelPosition::BelowSliders;
+
 // Where the shell puts the parts of a slider row, so ours can go in the same
 // places.
 //
@@ -412,8 +427,32 @@ struct SliderMetrics {
     double sliderRight = 300;
     double groupWidth = 358;
     double rowHeight = 40;
+
+    // What to leave below the panel when it sits directly on top of the
+    // native group, which is usually negative.
+    //
+    // The group carries its own top padding -- 12 on the GridView, 4 on the
+    // item, 2 to the slider inside it -- and that padding exists to separate
+    // the group from whatever is above. When the panel is what is above, it
+    // is paid twice, and 12px of native row spacing becomes 26. The panel
+    // gives the difference back.
+    double gapAbove = -6;
+
     bool measured = false;
 };
+
+// Only the position that butts up against the native rows is drawn to match
+// them. Below them and at the bottom the panel keeps its own proportions --
+// the one at the bottom is outside the card entirely, where matching a row it
+// is nowhere near would be imitation for its own sake.
+bool UseNativeMetrics() {
+    return g_panelPosition == PanelPosition::AboveSliders;
+}
+
+// The panel's own look, for every other position: what it had before there
+// was anything to line up with.
+inline constexpr double kOwnMargin = 16;
+inline constexpr double kOwnIconGap = 12;
 
 // XAML thread only, like everything else that touches the tree.
 SliderMetrics g_metrics;
@@ -425,17 +464,6 @@ bool g_hideStockBrightness = true;
 // unsupported.
 bool g_hideUnsupported = false;
 
-// Where the panel goes. L1Grid holds the toggles in row 0, the native sliders
-// in row 1 and the footer in row 2, and the card behind the first two is a
-// Border spanning rows 0-1 -- so "with the native sliders" means taking a row
-// inside that span and pushing what follows down, while "at the bottom" means
-// a row after everything and outside the card.
-enum class PanelPosition {
-    AboveSliders,
-    BelowSliders,
-    Bottom,
-};
-PanelPosition g_panelPosition = PanelPosition::BelowSliders;
 
 // The stock brightness row we collapsed and the group we shrank to close the
 // gap. Kept outside Injection because the sliders are virtualized: the row may
@@ -913,9 +941,11 @@ void PopulateSliderPanel(wuxc::StackPanel const& panel, Injection& injection) {
         // The gap the shell leaves between its icon and its track, derived
         // rather than guessed: the panel already starts at the icon's left
         // edge, so what is left over after the icon is the gap.
-        icon.Margin(wux::ThicknessHelper::FromLengths(
-            0, 0,
-            g_metrics.sliderLeft - g_metrics.iconLeft - icon.Width(), 0));
+        const double iconGap =
+            UseNativeMetrics()
+                ? g_metrics.sliderLeft - g_metrics.iconLeft - icon.Width()
+                : kOwnIconGap;
+        icon.Margin(wux::ThicknessHelper::FromLengths(0, 0, iconGap, 0));
         wuxc::Grid::SetColumn(icon, 0);
         sliderRow.Children().Append(icon);
 
@@ -925,10 +955,12 @@ void PopulateSliderPanel(wuxc::StackPanel const& panel, Injection& injection) {
         slider.Value(shownPercent);
         slider.IsThumbToolTipEnabled(true);
         slider.VerticalAlignment(wux::VerticalAlignment::Center);
-        // Matched to the shell's row so the track sits at the same height and
-        // the hit target is the same size. The default template is shorter,
-        // which reads as a thinner, flimsier control next to the real ones.
-        slider.Height(g_metrics.rowHeight);
+        if (UseNativeMetrics()) {
+            // Matched to the shell's row so the track sits at the same height
+            // and the hit target is the same size. The default template is
+            // shorter, which reads as a thinner control next to the real ones.
+            slider.Height(g_metrics.rowHeight);
+        }
         wuxc::Grid::SetColumn(slider, 1);
 
         SetIconLevel(icon, slider.Value());
@@ -981,14 +1013,18 @@ wuxc::StackPanel BuildSliderPanel(Injection& injection) {
     wuxc::StackPanel panel;
     panel.Name(L"WindhawkPerMonitorBrightness");
     panel.Orientation(wuxc::Orientation::Vertical);
-    // Left and right come from the native row so the icon column and the far
-    // end of the track line up with it; the panel used to be 6px left of the
-    // icons and 42px past the end of the sliders. Top and bottom are a group
-    // gap rather than a row gap -- these rows carry titles and are not
-    // pretending to be part of the same list.
-    panel.Margin(wux::ThicknessHelper::FromLengths(
-        g_metrics.iconLeft, 8, g_metrics.groupWidth - g_metrics.sliderRight,
-        8));
+    if (UseNativeMetrics()) {
+        // Left and right come from the native row so the icon column and the
+        // far end of the track line up with it; the panel used to be 6px left
+        // of the icons and 42px past the end of the sliders. The bottom is
+        // the seam with the group immediately below.
+        panel.Margin(wux::ThicknessHelper::FromLengths(
+            g_metrics.iconLeft, 8,
+            g_metrics.groupWidth - g_metrics.sliderRight, g_metrics.gapAbove));
+    } else {
+        panel.Margin(
+            wux::ThicknessHelper::FromLengths(kOwnMargin, 4, kOwnMargin, 8));
+    }
     PopulateSliderPanel(panel, injection);
     return panel;
 }
@@ -1257,6 +1293,21 @@ void MeasureNativeSliderMetrics(wux::FrameworkElement const& l1Grid) try {
         measured.iconLeft = measured.sliderLeft - 34;
     }
 
+    // What the panel has to give back so that the seam between it and the
+    // group looks like one more row boundary. Both halves come off the same
+    // row: how far the first slider sits below the top of the group, and how
+    // far two native sliders sit apart, which is twice the item's margin plus
+    // twice the slider's inset within it.
+    if (auto rowFe = row ? row.try_as<wux::FrameworkElement>() : nullptr) {
+        const double groupTop =
+            groupFe.TransformToVisual(l1Grid).TransformPoint({0, 0}).Y;
+        const double rowTop =
+            rowFe.TransformToVisual(l1Grid).TransformPoint({0, 0}).Y;
+        const double sliderInset = point.Y - rowTop;
+        const double nativeRowGap = 2 * (rowFe.Margin().Top + sliderInset);
+        measured.gapAbove = nativeRowGap - (point.Y - groupTop);
+    }
+
     // A row that measures as nonsense is worse than the defaults.
     if (measured.sliderRight <= measured.sliderLeft ||
         measured.iconLeft < 0 || measured.iconLeft >= measured.sliderLeft ||
@@ -1271,9 +1322,9 @@ void MeasureNativeSliderMetrics(wux::FrameworkElement const& l1Grid) try {
     measured.measured = true;
     g_metrics = measured;
     Wh_Log(L"Native slider row: icon at %.0f, slider %.0f..%.0f of %.0f, "
-           L"height %.0f",
+           L"height %.0f, seam %.0f",
            g_metrics.iconLeft, g_metrics.sliderLeft, g_metrics.sliderRight,
-           g_metrics.groupWidth, g_metrics.rowHeight);
+           g_metrics.groupWidth, g_metrics.rowHeight, g_metrics.gapAbove);
 } catch (...) {
     Wh_Log(L"Measuring the native slider row threw: %08X", winrt::to_hresult());
 }
