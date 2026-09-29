@@ -726,15 +726,22 @@ class Engine {
 
     // The capabilities string takes a second or more per monitor, so it is
     // read once per display per session, after the displays are already up,
-    // rather than as part of enumerating them. Worker thread; returns whether
-    // any display changed.
+    // rather than as part of enumerating them.
+    //
+    // Only a read that worked is kept. One that fails -- a monitor still
+    // waking, a dock still enumerating -- is tried again on the next rescan,
+    // up to kCapsAttempts times per connection, so a monitor that never
+    // answers it costs no more than that. Unplugging a monitor forgets both
+    // (see Rescan), so plugging it back in starts over. Worker thread; returns
+    // whether any display changed.
     bool LoadCapabilities() {
         std::vector<std::pair<std::wstring, HANDLE>> todo;
         {
             std::lock_guard<std::mutex> lock(mutex_);
             for (const auto& d : displays_) {
                 if (d.transport == Transport::DdcCi && d.hPhysical &&
-                    !caps_.count(d.stableId)) {
+                    !caps_.count(d.stableId) &&
+                    capsAttempts_[d.stableId] < kCapsAttempts) {
                     todo.emplace_back(d.stableId, d.hPhysical);
                 }
             }
@@ -746,7 +753,11 @@ class Engine {
             }
             std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
             Capabilities caps = ReadCapabilities(entry.second);
-            caps_[entry.first] = caps;
+            if (caps.loaded) {
+                caps_[entry.first] = caps;
+            } else {
+                ++capsAttempts_[entry.first];
+            }
             long long ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                                std::chrono::steady_clock::now() - start)
                                .count();
@@ -1518,19 +1529,25 @@ class Engine {
                       return a.rect.top < b.rect.top;
                   });
 
-        // A display that is gone takes its DDC/CI verdict with it, so
-        // unplugging and replugging a monitor that failed its first probe
-        // gets a fresh one rather than inheriting the old answer.
-        for (auto it = ddcAnswered_.begin(); it != ddcAnswered_.end();) {
-            bool present = false;
-            for (const Display& d : found) {
-                if (d.stableId == it->first) {
-                    present = true;
-                    break;
+        // A display that is gone takes its DDC/CI verdict and capabilities
+        // with it, so unplugging and replugging a monitor that failed its
+        // first probe, or its first capabilities read, gets a fresh one
+        // rather than inheriting the old answer.
+        auto dropMissing = [&found](auto& byDisplay) {
+            for (auto it = byDisplay.begin(); it != byDisplay.end();) {
+                bool present = false;
+                for (const Display& d : found) {
+                    if (d.stableId == it->first) {
+                        present = true;
+                        break;
+                    }
                 }
+                it = present ? std::next(it) : byDisplay.erase(it);
             }
-            it = present ? std::next(it) : ddcAnswered_.erase(it);
-        }
+        };
+        dropMissing(ddcAnswered_);
+        dropMissing(caps_);
+        dropMissing(capsAttempts_);
 
         {
             std::lock_guard<std::mutex> lock(mutex_);
@@ -1630,26 +1647,25 @@ class Engine {
         }
     }
 
-    // Looks up the DDC/CI handle for a display that has the given extra.
-    // Worker thread.
-    HANDLE DdcHandleFor(const std::wstring& stableId, DWORD* contrastMax,
-                        bool* hasPower) {
+    // The DDC/CI handle of a display, or null. Worker thread.
+    HANDLE DdcHandleFor(const std::wstring& stableId) {
         std::lock_guard<std::mutex> lock(mutex_);
-        for (const auto& d : displays_) {
-            if (d.stableId == stableId && d.transport == Transport::DdcCi) {
-                *contrastMax = d.contrastMax;
-                *hasPower = d.hasPower;
-                return d.hPhysical;
-            }
-        }
-        return nullptr;
+        const Display* d = FindLocked(stableId);
+        return d && d->transport == Transport::DdcCi ? d->hPhysical : nullptr;
+    }
+
+    // One field of a display, read under the lock; fallback if it is gone.
+    template <typename T>
+    T DisplayField(const std::wstring& stableId, T Display::*field, T fallback) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        const Display* d = FindLocked(stableId);
+        return d ? d->*field : fallback;
     }
 
     // Returns whether anything went on the wire, for the DDC/CI cooldown.
     bool ApplyContrast(const std::wstring& stableId, int percent) {
-        DWORD contrastMax = 0;
-        bool hasPower = false;
-        HANDLE hPhysical = DdcHandleFor(stableId, &contrastMax, &hasPower);
+        HANDLE hPhysical = DdcHandleFor(stableId);
+        const DWORD contrastMax = DisplayField<DWORD>(stableId, &Display::contrastMax, 0);
         if (!hPhysical || contrastMax == 0) {
             return false;
         }
@@ -1667,9 +1683,7 @@ class Engine {
     }
 
     bool ApplyVcp(const std::wstring& stableId, BYTE code, DWORD raw) {
-        DWORD contrastMax = 0;
-        bool hasPower = false;
-        HANDLE hPhysical = DdcHandleFor(stableId, &contrastMax, &hasPower);
+        HANDLE hPhysical = DdcHandleFor(stableId);
         if (!hPhysical) {
             return false;
         }
@@ -1679,10 +1693,8 @@ class Engine {
     }
 
     bool ApplyPower(const std::wstring& stableId, bool on) {
-        DWORD contrastMax = 0;
-        bool hasPower = false;
-        HANDLE hPhysical = DdcHandleFor(stableId, &contrastMax, &hasPower);
-        if (!hPhysical || !hasPower) {
+        HANDLE hPhysical = DdcHandleFor(stableId);
+        if (!hPhysical || !DisplayField(stableId, &Display::hasPower, false)) {
             return false;
         }
         bool ok = SetVCPFeature(hPhysical, kVcpPower, on ? kPowerOn : kPowerOff) !=
@@ -1762,8 +1774,11 @@ class Engine {
     std::map<std::wstring, int> pendingContrast_;
     std::map<std::wstring, bool> pendingPower_;
     std::map<std::pair<std::wstring, BYTE>, DWORD> pendingVcp_;
-    // Capabilities read this session, by display. Worker thread only.
+    // Capabilities read this session, by display, and how many reads have
+    // failed for the ones not read yet. Worker thread only.
+    static constexpr int kCapsAttempts = 3;
     std::map<std::wstring, Capabilities> caps_;
+    std::map<std::wstring, int> capsAttempts_;
 
     // Where relative following thinks each display would be if brightness had
     // no end stops. Guarded by mutex_.

@@ -36,7 +36,8 @@ read once per session in the background.
 - "All displays" brightness and contrast sliders that set every display to the
   same level.
 - A power button at the end of the brightness slider of monitors that support
-  it, offered only while another display is connected.
+  it, offered only while another display is connected. It never turns off the
+  last screen that is still on.
 - A volume slider for monitors with audio, with the shell's own animated
   speaker icon.
 - Input buttons (HDMI 1, HDMI 2, DP 1...) that switch a monitor's input.
@@ -86,7 +87,7 @@ covers only what it names.
 | Show input buttons | on | One button per input the monitor lists; pressing one switches to it |
 | Mouse wheel step | 5 | Percentage points per notch; 0 leaves the wheel to the flyout |
 | Click an icon to jump to a level | off | Left, middle and right click levels are settings of their own |
-| Per-display settings | — | Text to look for in a display's name or device id, then a name to show and what to hide |
+| Per-display settings | — | Text to look for in a monitor's own name (its model, not a name you gave it) or device id, then a name to show and what to hide. Hiding a monitor's contrast also keeps the all-displays contrast slider off it |
 
 "Laptop brightness keys control every monitor" is off by default because
 Windows raises the same signal for a brightness key, for the power plan's AC and
@@ -112,6 +113,10 @@ setting off or disabling the mod: the monitor stores the value itself.
 - The power button turns a monitor off over DDC/CI. Most monitors still listen
   in that state and come back when it is pressed again; one that does not has
   to be switched on with its own button.
+- Many DisplayPort monitors drop off the connection once turned off this way.
+  Windows then treats them as unplugged, and their row, with its button to
+  turn them back on, leaves the panel until they are switched on with their
+  own power button.
 - Switching a monitor's input hands it to whatever is on that input. Some
   monitors keep answering DDC/CI on the input they left, so you can switch back
   from here; others need their own buttons.
