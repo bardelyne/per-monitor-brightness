@@ -11,7 +11,7 @@
 | `probe/layout-probe.wh.cpp` | Read-only dump of where the native slider group sits in `L1Grid`. What the panel-position setting was designed against. |
 | `stage_test.cpp` | Single-threaded bisect of the engine's dependencies: COM, WMI and DDC/CI in order, each step printed unbuffered. What told the startup crash apart from a threading bug. |
 | `build_mod.sh` | Splices the engine into the template to produce the `.wh.cpp`. |
-| `install_mod.sh` | Compiles and installs the mod without the Windhawk GUI, then hot-reloads it. Needs an elevated shell. |
+| `install_mod.sh` | Regenerates, compiles and installs the mod without the Windhawk GUI, then hot-reloads it. Needs an elevated shell. |
 
 Windhawk mods must be a single source file, hence the splice step. Keeping the
 engine separate is what allowed it to be tested outside the shell — which is how
@@ -60,11 +60,13 @@ separates a real fault from an optimiser artefact.
 
 ## Building and installing without the GUI
 
-`install_mod.sh` compiles with Windhawk's own clang against
+`install_mod.sh` runs `build_mod.sh` first, so it never installs a stale
+splice, then compiles with Windhawk's own clang against the newest
 `Engine\<ver>\64\windhawk.lib`, drops the DLL into `Engine\Mods\64` under a
-fresh name, points the registry at it and bumps `SettingsChangeTime` so the
-service hot-reloads. It needs an elevated shell, since the mod's registry keys
-live under HKLM.
+fresh name, points the registry at it with `reg.exe` and bumps
+`SettingsChangeTime` so the service hot-reloads. The version comes from the
+mod's own `@version` line. It needs an elevated shell, since the mod's
+registry keys live under HKLM.
 
 Two things it must get right, both of which fail silently otherwise:
 

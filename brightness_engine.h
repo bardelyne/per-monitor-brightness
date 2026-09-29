@@ -4,6 +4,12 @@
 //   * DDC/CI  (external monitors) -- low-level VCP 0x10 over I2C. ~56 ms/write.
 //   * WMI     (internal laptop panels) -- WmiMonitorBrightnessMethods.
 //
+// DDC/CI displays can also carry contrast (VCP 0x12), power (0xD6), speaker
+// volume (0x62) and input selection (0x60), each probed separately: a monitor
+// that answers brightness does not necessarily answer any of them. Which
+// inputs exist only the monitor's capabilities string says, so that is read
+// too -- once, and in the background, because it is slow.
+//
 // Every hardware call happens on one worker thread. Callers post a target
 // percentage and return immediately; the worker coalesces, so a slider drag
 // that posts 200 values only puts as many on the wire as the bus can carry.
@@ -71,6 +77,28 @@ struct Display {
     // DdcCi
     HANDLE hPhysical = nullptr;
     DWORD vcpMax = 100;  // raw scale; a Samsung G32 reports 50, not 100
+
+    // Contrast, VCP 0x12. DDC/CI only; contrastMax stays 0 for a display that
+    // does not answer it, and contrast stays -1 until it is read.
+    int contrast = -1;
+    DWORD contrastMax = 0;
+
+    // Power, VCP 0xD6. Only a display that reports an actual power state gets
+    // a button: plenty of monitors answer the read with 0, which is no state
+    // at all, and ignore writes to it.
+    bool hasPower = false;
+    bool poweredOff = false;
+
+    // Speaker volume, VCP 0x62, for monitors with audio.
+    int volume = -1;
+    DWORD volumeMax = 0;
+
+    // Input source, VCP 0x60: the values the monitor lists in its
+    // capabilities, and which of them is current -- -1 when that is not known,
+    // since some monitors answer the read with a value their own list does
+    // not contain.
+    std::vector<int> inputs;
+    int input = -1;
 
     // Wmi
     std::wstring wmiPath;  // __RELPATH of the WmiMonitorBrightnessMethods instance
@@ -449,6 +477,81 @@ class Engine {
         SetPercentInternal(stableId, percent, /*rebaseFollow=*/true);
     }
 
+    // Contrast, coalesced exactly like brightness. Displays without contrast
+    // ignore it.
+    void SetContrast(const std::wstring& stableId, int percent) {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            bool known = false;
+            for (auto& d : displays_) {
+                if (d.stableId == stableId && d.contrastMax > 0) {
+                    d.contrast = std::clamp(percent, 0, 100);
+                    known = true;
+                }
+            }
+            if (!known) {
+                return;
+            }
+            pendingContrast_[stableId] = std::clamp(percent, 0, 100);
+        }
+        work_.notify_all();
+    }
+
+    // Speaker volume, coalesced like brightness.
+    void SetVolume(const std::wstring& stableId, int percent) {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            Display* d = FindLocked(stableId);
+            if (!d || d->volumeMax == 0) {
+                return;
+            }
+            d->volume = std::clamp(percent, 0, 100);
+            pendingVcp_[{stableId, kVcpVolume}] =
+                static_cast<DWORD>((d->volume * d->volumeMax + 50) / 100);
+        }
+        work_.notify_all();
+    }
+
+    // Switches the monitor to one of the inputs it lists. Switching away from
+    // the one this PC is on hands the monitor to whatever is on the other
+    // input; whether it still answers DDC/CI from here afterwards depends on
+    // the monitor.
+    void SetInput(const std::wstring& stableId, int value) {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            Display* d = FindLocked(stableId);
+            if (!d || std::find(d->inputs.begin(), d->inputs.end(), value) == d->inputs.end()) {
+                return;
+            }
+            d->input = value;
+            pendingVcp_[{stableId, kVcpInput}] = static_cast<DWORD>(value);
+        }
+        work_.notify_all();
+    }
+
+    // Turns a display off (DPM off) or back on. Off is 0x04 rather than 0x05:
+    // 0x05 is the monitor's own power button, after which many monitors stop
+    // listening on DDC/CI altogether, whereas one in DPM off usually still
+    // answers the 0x01 that turns it back on. Usually -- some do not, and then
+    // only the monitor's own button brings it back.
+    void SetPower(const std::wstring& stableId, bool on) {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            bool known = false;
+            for (auto& d : displays_) {
+                if (d.stableId == stableId && d.hasPower) {
+                    d.poweredOff = !on;
+                    known = true;
+                }
+            }
+            if (!known) {
+                return;
+            }
+            pendingPower_[stableId] = on;
+        }
+        work_.notify_all();
+    }
+
    private:
     void SetPercentInternal(const std::wstring& stableId, int percent,
                             bool rebaseFollow) {
@@ -506,6 +609,159 @@ class Engine {
 
    private:
     static constexpr BYTE kVcpLuminance = 0x10;
+    static constexpr BYTE kVcpContrast = 0x12;
+    static constexpr BYTE kVcpPower = 0xD6;
+    static constexpr DWORD kPowerOn = 0x01;
+    static constexpr DWORD kPowerOff = 0x04;  // DPM off; see SetPower
+    static constexpr BYTE kVcpVolume = 0x62;
+    static constexpr BYTE kVcpInput = 0x60;
+
+    // Caller holds mutex_.
+    Display* FindLocked(const std::wstring& stableId) {
+        for (auto& d : displays_) {
+            if (d.stableId == stableId) {
+                return &d;
+            }
+        }
+        return nullptr;
+    }
+
+    // What a monitor's capabilities string says about the VCP codes it
+    // implements: each code, and the values it lists for it, if any.
+    struct Capabilities {
+        bool loaded = false;
+        std::map<int, std::vector<int>> vcp;
+    };
+
+    static int HexDigit(char c) {
+        if (c >= '0' && c <= '9') return c - '0';
+        if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+        if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+        return -1;
+    }
+
+    // "...vcp(02 04 10 12 14(05 08 0B) 60(11 12 ) 62 8D)..." -> {0x02: {},
+    // ..., 0x14: {5, 8, 11}, 0x60: {0x11, 0x12}, ...}. Codes are read two hex
+    // digits at a time, which also covers the monitors that pack the list
+    // with no spaces at all.
+    static Capabilities ParseCapabilities(const std::string& text) {
+        Capabilities caps;
+        std::string lower = text;
+        std::transform(lower.begin(), lower.end(), lower.begin(),
+                       [](char c) { return static_cast<char>(tolower(static_cast<unsigned char>(c))); });
+        size_t at = lower.find("vcp(");
+        if (at == std::string::npos) {
+            return caps;
+        }
+        size_t i = at + 4;
+        auto readByte = [&](size_t& k) -> int {
+            while (k < text.size() && text[k] == ' ') ++k;
+            if (k + 1 < text.size() && HexDigit(text[k]) >= 0 && HexDigit(text[k + 1]) >= 0) {
+                int v = HexDigit(text[k]) * 16 + HexDigit(text[k + 1]);
+                k += 2;
+                return v;
+            }
+            return -1;
+        };
+        while (i < text.size()) {
+            while (i < text.size() && text[i] == ' ') ++i;
+            if (i >= text.size() || text[i] == ')') {
+                break;
+            }
+            int code = readByte(i);
+            if (code < 0) {
+                ++i;  // something unexpected; skip it rather than stop
+                continue;
+            }
+            std::vector<int>& values = caps.vcp[code];
+            while (i < text.size() && text[i] == ' ') ++i;
+            if (i < text.size() && text[i] == '(') {
+                ++i;
+                int depth = 1;
+                while (i < text.size() && depth > 0) {
+                    while (i < text.size() && text[i] == ' ') ++i;
+                    if (i >= text.size()) break;
+                    if (text[i] == '(') {
+                        ++depth;
+                        ++i;
+                    } else if (text[i] == ')') {
+                        --depth;
+                        ++i;
+                    } else {
+                        int v = readByte(i);
+                        if (v < 0) {
+                            ++i;
+                        } else if (depth == 1) {
+                            values.push_back(v);
+                        }
+                    }
+                }
+            }
+        }
+        caps.loaded = true;
+        return caps;
+    }
+
+    static Capabilities ReadCapabilities(HANDLE hPhysical) {
+        DWORD length = 0;
+        if (!GetCapabilitiesStringLength(hPhysical, &length) || length == 0 ||
+            length > 16384) {
+            return {};
+        }
+        std::string text(length, '\0');
+        if (!CapabilitiesRequestAndCapabilitiesReply(hPhysical, text.data(), length)) {
+            return {};
+        }
+        text.resize(strnlen(text.c_str(), length));
+        return ParseCapabilities(text);
+    }
+
+    // Caller holds mutex_, or owns d outright (Rescan, before publishing).
+    static void ApplyCapabilities(Display& d, const Capabilities& caps) {
+        auto input = caps.vcp.find(0x60);
+        if (input != caps.vcp.end() && input->second.size() >= 2) {
+            d.inputs = input->second;
+        }
+    }
+
+    // The capabilities string takes a second or more per monitor, so it is
+    // read once per display per session, after the displays are already up,
+    // rather than as part of enumerating them. Worker thread; returns whether
+    // any display changed.
+    bool LoadCapabilities() {
+        std::vector<std::pair<std::wstring, HANDLE>> todo;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            for (const auto& d : displays_) {
+                if (d.transport == Transport::DdcCi && d.hPhysical &&
+                    !caps_.count(d.stableId)) {
+                    todo.emplace_back(d.stableId, d.hPhysical);
+                }
+            }
+        }
+        bool changed = false;
+        for (const auto& entry : todo) {
+            if (stopping_.load()) {
+                break;
+            }
+            std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
+            Capabilities caps = ReadCapabilities(entry.second);
+            caps_[entry.first] = caps;
+            long long ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                               std::chrono::steady_clock::now() - start)
+                               .count();
+            Log(L"capabilities %ls: %ls, %zu code(s) (%lld ms)", entry.first.c_str(),
+                caps.loaded ? L"read" : L"unavailable", caps.vcp.size(), ms);
+            if (caps.loaded) {
+                std::lock_guard<std::mutex> lock(mutex_);
+                if (Display* d = FindLocked(entry.first)) {
+                    ApplyCapabilities(*d, caps);
+                    changed = true;
+                }
+            }
+        }
+        return changed;
+    }
 
     void Log(const wchar_t* fmt, ...) {
         if (!log_) {
@@ -544,6 +800,11 @@ class Engine {
         ready_.notify_all();
         NotifyChanged(true);
 
+        // After the panel has its rows, not before: this is the slow part.
+        if (LoadCapabilities()) {
+            NotifyChanged(true);
+        }
+
         // Only worth a thread if something here reports brightness events;
         // DDC/CI has no equivalent, so this is the internal panel only.
         bool haveWmiPanel = false;
@@ -568,23 +829,32 @@ class Engine {
 
         for (;;) {
             std::map<std::wstring, int> batch;
+            std::map<std::wstring, int> contrastBatch;
+            std::map<std::wstring, bool> powerBatch;
+            std::map<std::pair<std::wstring, BYTE>, DWORD> vcpBatch;
             bool doRescan = false;
             bool doRefresh = false;
             {
                 std::unique_lock<std::mutex> lock(mutex_);
                 work_.wait(lock, [this] {
-                    return quit_ || rescan_ || refresh_ || !pending_.empty();
+                    return quit_ || rescan_ || refresh_ || !pending_.empty() ||
+                           !pendingContrast_.empty() || !pendingPower_.empty() ||
+                           !pendingVcp_.empty();
                 });
                 if (quit_) {
                     break;
                 }
                 doRescan = std::exchange(rescan_, false);
                 batch.swap(pending_);
+                contrastBatch.swap(pendingContrast_);
+                powerBatch.swap(pendingPower_);
+                vcpBatch.swap(pendingVcp_);
                 // Never read back while writes are still queued: the value in
                 // flight has not reached the panel yet, so reading now would
                 // yank the slider backwards under the user's finger. refresh_
                 // stays set and we come back to it once the queue drains.
-                doRefresh = batch.empty() && refresh_;
+                doRefresh = batch.empty() && contrastBatch.empty() &&
+                            powerBatch.empty() && vcpBatch.empty() && refresh_;
                 if (doRefresh) {
                     refresh_ = false;
                 }
@@ -593,14 +863,34 @@ class Engine {
             if (doRescan) {
                 Rescan();
                 NotifyChanged(true);
+                if (LoadCapabilities()) {
+                    NotifyChanged(true);
+                }
             }
 
             // Each write blocks for tens of ms. Anything the UI posts while
             // we are on the wire lands in pending_ and overwrites its
             // predecessor, so we always resume with the newest value.
             bool wroteDdc = false;
+            // Power first, so a display being switched back on is on before
+            // anything else is written to it.
+            for (const auto& entry : powerBatch) {
+                if (ApplyPower(entry.first, entry.second)) {
+                    wroteDdc = true;
+                }
+            }
             for (const auto& entry : batch) {
                 if (Apply(entry.first, entry.second) == Transport::DdcCi) {
+                    wroteDdc = true;
+                }
+            }
+            for (const auto& entry : contrastBatch) {
+                if (ApplyContrast(entry.first, entry.second)) {
+                    wroteDdc = true;
+                }
+            }
+            for (const auto& entry : vcpBatch) {
+                if (ApplyVcp(entry.first.first, entry.first.second, entry.second)) {
                     wroteDdc = true;
                 }
             }
@@ -678,6 +968,10 @@ class Engine {
             Transport transport;
             HANDLE hPhysical;
             std::wstring wmiKey;
+            bool hasContrast;
+            bool hasPower;
+            bool hasVolume;
+            std::vector<int> inputs;
         };
 
         std::vector<Target> targets;
@@ -686,7 +980,9 @@ class Engine {
             std::lock_guard<std::mutex> lock(mutex_);
             for (const auto& d : displays_) {
                 targets.push_back({d.stableId, d.transport, d.hPhysical,
-                                   detail::ToLower(d.stableId)});
+                                   detail::ToLower(d.stableId),
+                                   d.contrastMax > 0, d.hasPower,
+                                   d.volumeMax > 0, d.inputs});
                 if (d.transport == Transport::Wmi) {
                     needWmi = true;
                 }
@@ -699,6 +995,10 @@ class Engine {
         }
 
         std::vector<std::pair<std::wstring, int>> updates;
+        std::vector<std::pair<std::wstring, int>> contrastUpdates;
+        std::vector<std::pair<std::wstring, bool>> powerUpdates;
+        std::vector<std::pair<std::wstring, int>> volumeUpdates;
+        std::vector<std::pair<std::wstring, int>> inputUpdates;
         for (const Target& target : targets) {
             int percent = -1;
             switch (target.transport) {
@@ -711,6 +1011,48 @@ class Engine {
                         maximum > 0) {
                         percent = static_cast<int>((current * 100 + maximum / 2) /
                                                    maximum);
+                    }
+                    if (target.hasContrast) {
+                        current = maximum = 0;
+                        if (GetVCPFeatureAndVCPFeatureReply(
+                                target.hPhysical, kVcpContrast, &type, &current,
+                                &maximum) &&
+                            maximum > 0) {
+                            contrastUpdates.emplace_back(
+                                target.id,
+                                static_cast<int>((current * 100 + maximum / 2) /
+                                                 maximum));
+                        }
+                    }
+                    if (target.hasPower) {
+                        current = maximum = 0;
+                        if (GetVCPFeatureAndVCPFeatureReply(
+                                target.hPhysical, kVcpPower, &type, &current,
+                                &maximum) &&
+                            current >= 1 && current <= 5) {
+                            powerUpdates.emplace_back(target.id, current >= 4);
+                        }
+                    }
+                    if (target.hasVolume) {
+                        current = maximum = 0;
+                        if (GetVCPFeatureAndVCPFeatureReply(target.hPhysical, kVcpVolume,
+                                                            &type, &current, &maximum) &&
+                            maximum > 0) {
+                            volumeUpdates.emplace_back(
+                                target.id,
+                                static_cast<int>((current * 100 + maximum / 2) / maximum));
+                        }
+                    }
+                    if (!target.inputs.empty()) {
+                        current = maximum = 0;
+                        // A value outside the monitor's own list (the Samsung
+                        // G32 answers 5) is not an input; keep what was set.
+                        if (GetVCPFeatureAndVCPFeatureReply(target.hPhysical, kVcpInput,
+                                                            &type, &current, &maximum) &&
+                            std::find(target.inputs.begin(), target.inputs.end(),
+                                      static_cast<int>(current)) != target.inputs.end()) {
+                            inputUpdates.emplace_back(target.id, static_cast<int>(current));
+                        }
                     }
                     break;
                 }
@@ -737,6 +1079,29 @@ class Engine {
                         d.percent = update.second;
                         break;
                     }
+                }
+            }
+            for (const auto& update : contrastUpdates) {
+                for (auto& d : displays_) {
+                    if (d.stableId == update.first) {
+                        d.contrast = update.second;
+                        break;
+                    }
+                }
+            }
+            for (const auto& update : powerUpdates) {
+                if (Display* d = FindLocked(update.first)) {
+                    d->poweredOff = update.second;
+                }
+            }
+            for (const auto& update : volumeUpdates) {
+                if (Display* d = FindLocked(update.first)) {
+                    d->volume = update.second;
+                }
+            }
+            for (const auto& update : inputUpdates) {
+                if (Display* d = FindLocked(update.first)) {
+                    d->input = update.second;
                 }
             }
         }
@@ -1217,6 +1582,7 @@ class Engine {
                 d->vcpMax = maximum;
                 d->percent =
                     static_cast<int>((current * 100 + maximum / 2) / maximum);
+                ProbeExtras(d);
                 attached = true;
                 continue;  // keep this handle alive
             }
@@ -1224,6 +1590,106 @@ class Engine {
         }
 
         return attached;
+    }
+
+    // Contrast and power are extras on the handle that answered brightness.
+    // A monitor that does not implement one fails the read (or answers it
+    // with nothing usable), which costs one I2C round trip and leaves that
+    // extra off.
+    void ProbeExtras(Display* d) {
+        MC_VCP_CODE_TYPE type{};
+        DWORD current = 0, maximum = 0;
+        if (GetVCPFeatureAndVCPFeatureReply(d->hPhysical, kVcpContrast, &type,
+                                            &current, &maximum) &&
+            maximum > 0) {
+            d->contrastMax = maximum;
+            d->contrast =
+                static_cast<int>((current * 100 + maximum / 2) / maximum);
+        }
+        // 1 on, 2 standby, 3 suspend, 4 off, 5 off by the power button. A
+        // monitor that answers 0 -- the Samsung G32 does -- has no power
+        // control to offer, however willingly it answers the read.
+        current = maximum = 0;
+        if (GetVCPFeatureAndVCPFeatureReply(d->hPhysical, kVcpPower, &type,
+                                            &current, &maximum) &&
+            current >= 1 && current <= 5) {
+            d->hasPower = true;
+            d->poweredOff = current >= 4;
+        }
+        current = maximum = 0;
+        if (GetVCPFeatureAndVCPFeatureReply(d->hPhysical, kVcpVolume, &type, &current,
+                                            &maximum) &&
+            maximum > 0) {
+            d->volumeMax = maximum;
+            d->volume = static_cast<int>((current * 100 + maximum / 2) / maximum);
+        }
+        // Capabilities already read this session carry over to a rescan.
+        auto caps = caps_.find(d->stableId);
+        if (caps != caps_.end() && caps->second.loaded) {
+            ApplyCapabilities(*d, caps->second);
+        }
+    }
+
+    // Looks up the DDC/CI handle for a display that has the given extra.
+    // Worker thread.
+    HANDLE DdcHandleFor(const std::wstring& stableId, DWORD* contrastMax,
+                        bool* hasPower) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        for (const auto& d : displays_) {
+            if (d.stableId == stableId && d.transport == Transport::DdcCi) {
+                *contrastMax = d.contrastMax;
+                *hasPower = d.hasPower;
+                return d.hPhysical;
+            }
+        }
+        return nullptr;
+    }
+
+    // Returns whether anything went on the wire, for the DDC/CI cooldown.
+    bool ApplyContrast(const std::wstring& stableId, int percent) {
+        DWORD contrastMax = 0;
+        bool hasPower = false;
+        HANDLE hPhysical = DdcHandleFor(stableId, &contrastMax, &hasPower);
+        if (!hPhysical || contrastMax == 0) {
+            return false;
+        }
+        std::chrono::steady_clock::time_point start =
+            std::chrono::steady_clock::now();
+        DWORD raw = static_cast<DWORD>(
+            (static_cast<DWORD>(percent) * contrastMax + 50) / 100);
+        bool ok = SetVCPFeature(hPhysical, kVcpContrast, raw) != FALSE;
+        long long ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                           std::chrono::steady_clock::now() - start)
+                           .count();
+        Log(L"contrast %ls -> %d%% ok=%d (%lld ms)", stableId.c_str(), percent,
+            ok ? 1 : 0, ms);
+        return true;
+    }
+
+    bool ApplyVcp(const std::wstring& stableId, BYTE code, DWORD raw) {
+        DWORD contrastMax = 0;
+        bool hasPower = false;
+        HANDLE hPhysical = DdcHandleFor(stableId, &contrastMax, &hasPower);
+        if (!hPhysical) {
+            return false;
+        }
+        bool ok = SetVCPFeature(hPhysical, code, raw) != FALSE;
+        Log(L"vcp %02X %ls -> %lu ok=%d", code, stableId.c_str(), raw, ok ? 1 : 0);
+        return true;
+    }
+
+    bool ApplyPower(const std::wstring& stableId, bool on) {
+        DWORD contrastMax = 0;
+        bool hasPower = false;
+        HANDLE hPhysical = DdcHandleFor(stableId, &contrastMax, &hasPower);
+        if (!hPhysical || !hasPower) {
+            return false;
+        }
+        bool ok = SetVCPFeature(hPhysical, kVcpPower, on ? kPowerOn : kPowerOff) !=
+                  FALSE;
+        Log(L"power %ls -> %ls ok=%d", stableId.c_str(), on ? L"on" : L"off",
+            ok ? 1 : 0);
+        return true;
     }
 
     Transport Apply(const std::wstring& stableId, int percent) {
@@ -1293,6 +1759,11 @@ class Engine {
     std::condition_variable work_;
     std::condition_variable ready_;
     std::map<std::wstring, int> pending_;
+    std::map<std::wstring, int> pendingContrast_;
+    std::map<std::wstring, bool> pendingPower_;
+    std::map<std::pair<std::wstring, BYTE>, DWORD> pendingVcp_;
+    // Capabilities read this session, by display. Worker thread only.
+    std::map<std::wstring, Capabilities> caps_;
 
     // Where relative following thinks each display would be if brightness had
     // no end stops. Guarded by mutex_.
