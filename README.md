@@ -5,7 +5,7 @@ for every connected display to the Windows 11 Quick Settings panel, each
 carrying the shell's own animated brightness icon -- plus contrast, volume,
 input and power controls where the monitor supports them, and sliders that set
 every display at once.
-
+ 
 > [!WARNING]
 > **If a monitor shows "Brightness control not supported" after it worked
 > before** (often after waking from sleep), the monitor has stopped answering
