@@ -8,7 +8,7 @@
 // @include         ShellHost.exe
 // @architecture    x86-64
 // @license         GPL-3.0
-// @compilerOptions -ldxva2 -lole32 -loleaut32 -lwbemuuid -luuid -lruntimeobject
+// @compilerOptions -ldxva2 -lgdi32 -lole32 -loleaut32 -lwbemuuid -luuid -lruntimeobject
 // ==/WindhawkMod==
 
 // Source code is published under The GNU General Public License v3.0.
@@ -330,6 +330,48 @@ include stays off.
   $name: Middle click level
 - iconClickRight: 100
   $name: Right click level
+- whitePointOnIconClick: true
+  $name: Click brightness icon to toggle Reduce White Point
+  $description: >-
+    Left-clicking a display's brightness icon toggles Reduce White Point (software
+    dimming on top of the hardware brightness slider, similar to Apple's Reduce
+    White Point). Leaves the brightness slider's full 0-100% range usable at a
+    lower nit ceiling. Takes precedence over left-click level jump.
+- whitePointReducePercent: 70
+  $name: Reduce White Point level (%)
+  $description: >-
+    How much to reduce white point intensity when toggled on (10-99%). At 70%,
+    the display's effective brightness range scales down to 30% of normal.
+
+    Note: On backlit LCD panels (such as IPS/VA), software white point
+    reduction only dims pixel values and cannot lower the physical LED
+    backlight below its hardware minimum, so high values (80%+) may show
+    backlight bleed or washed-out blacks; OLED panels dim cleanly down to true
+    black.
+- whitePointMethod: auto
+  $name: Reduce White Point method
+  $description: >-
+    How Reduce White Point dims the display. "Auto" tries per-monitor DDC/CI
+    RGB gain on external monitors, per-monitor GPU gamma ramp in SDR, and falls
+    back to the DWM color matrix when HDR blocks gamma ramps.
+  $options:
+  - auto: Auto (per-monitor, HDR-aware)
+  - gamma: GPU gamma ramp (per-monitor, SDR)
+  - ddc: DDC/CI RGB gain (external monitors)
+  - magnification: DWM color matrix (works in HDR, all displays)
+- whitePointScheduleEnabled: false
+  $name: Schedule Reduce White Point
+  $description: >-
+    Automatically turn Reduce White Point on and off on all displays at
+    scheduled local times (for example, 20:00 to 05:00).
+- whitePointScheduleStart: "20:00"
+  $name: Schedule start time (HH:MM)
+  $description: >-
+    Local time in 24-hour HH:MM format to turn Reduce White Point on.
+- whitePointScheduleEnd: "05:00"
+  $name: Schedule end time (HH:MM)
+  $description: >-
+    Local time in 24-hour HH:MM format to turn Reduce White Point off.
 - displaySettings:
   - - match: ""
       $name: Text to look for
@@ -491,6 +533,7 @@ constexpr wchar_t kAnimatedIconClass[] = L"Microsoft.UI.Xaml.Controls.AnimatedIc
 #include <wbemidl.h>
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <condition_variable>
 #include <cstdarg>
@@ -520,14 +563,25 @@ enum class Transport {
     Wmi,    // internal panel
 };
 
+// How "Reduce White Point" dims a display without touching its hardware
+// brightness slider (so 0-100% scales down into a lower nit range).
+enum class WhitePointMethod {
+    Auto,           // DDC/CI RGB gain (external) or GPU gamma ramp (SDR), with DWM fallback for HDR
+    GammaRamp,      // Per-monitor GPU gamma LUT (SetDeviceGammaRamp; SDR only)
+    DdcRgbGain,     // Per-monitor DDC/CI video gain R/G/B (VCP 0x16/0x18/0x1A)
+    Magnification,  // DWM fullscreen color matrix (works in HDR, Start Menu, Alt+Tab; global)
+};
+
 struct Display {
     // Stable across reboots, hotplug and monitor reordering: derived from the
     // EDID device instance path. HMONITOR is not stable, so it is never a key.
     std::wstring stableId;
     std::wstring name;           // "LS27F32xG", "Built-in display"
+    std::wstring gdiDeviceName;  // "\\.\DISPLAY5"
     RECT rect{};
     Transport transport = Transport::None;
     int percent = -1;  // last known, -1 if never read
+    bool whitePointReduced = false;
 
     // DdcCi
     HANDLE hPhysical = nullptr;
@@ -866,6 +920,48 @@ class Engine {
         followMode_ = mode;
     }
 
+    void SetWhitePointConfig(int reducePercent, WhitePointMethod method) {
+        bool needReapply = false;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            int clamped = std::clamp(reducePercent, 10, 99);
+            if (whitePointReducePercent_ != clamped || whitePointMethod_ != method) {
+                whitePointReducePercent_ = clamped;
+                whitePointMethod_ = method;
+                for (const auto& id : whitePointReducedIds_) {
+                    pendingWhitePoint_[id] = true;
+                    needReapply = true;
+                }
+            }
+        }
+        if (needReapply) {
+            work_.notify_all();
+        }
+    }
+
+    void SetWhitePointSchedule(bool enabled, int startMin, int endMin) {
+        bool changed = false;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            int clampedStart = std::clamp(startMin, 0, 24 * 60 - 1);
+            int clampedEnd = std::clamp(endMin, 0, 24 * 60 - 1);
+            if (whitePointScheduleEnabled_ != enabled ||
+                whitePointScheduleStartMin_ != clampedStart ||
+                whitePointScheduleEndMin_ != clampedEnd) {
+                whitePointScheduleEnabled_ = enabled;
+                whitePointScheduleStartMin_ = clampedStart;
+                whitePointScheduleEndMin_ = clampedEnd;
+                if (enabled) {
+                    whitePointScheduleEvalImmediate_ = true;
+                }
+                changed = true;
+            }
+        }
+        if (changed) {
+            work_.notify_all();
+        }
+    }
+
     void Start() {
         if (worker_.joinable()) {
             return;
@@ -1007,6 +1103,47 @@ class Engine {
         work_.notify_all();
     }
 
+    void SetWhitePointReduced(const std::wstring& stableId, bool reduced) {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            Display* d = FindLocked(stableId);
+            if (!d) {
+                return;
+            }
+            d->whitePointReduced = reduced;
+            if (reduced) {
+                whitePointReducedIds_.insert(stableId);
+            } else {
+                whitePointReducedIds_.erase(stableId);
+            }
+            SaveWhitePointEntry(stableId, reduced);
+            pendingWhitePoint_[stableId] = reduced;
+        }
+        work_.notify_all();
+    }
+
+    bool ToggleWhitePointReduced(const std::wstring& stableId) {
+        bool next = false;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            Display* d = FindLocked(stableId);
+            if (!d) {
+                return false;
+            }
+            next = !d->whitePointReduced;
+            d->whitePointReduced = next;
+            if (next) {
+                whitePointReducedIds_.insert(stableId);
+            } else {
+                whitePointReducedIds_.erase(stableId);
+            }
+            SaveWhitePointEntry(stableId, next);
+            pendingWhitePoint_[stableId] = next;
+        }
+        work_.notify_all();
+        return next;
+    }
+
    private:
     void SetPercentInternal(const std::wstring& stableId, int percent,
                             bool rebaseFollow) {
@@ -1066,6 +1203,9 @@ class Engine {
     static constexpr DWORD kPowerOff = 0x04;  // DPM off; see SetPower
     static constexpr BYTE kVcpVolume = 0x62;
     static constexpr BYTE kVcpInput = 0x60;
+    static constexpr BYTE kVcpRedGain = 0x16;
+    static constexpr BYTE kVcpGreenGain = 0x18;
+    static constexpr BYTE kVcpBlueGain = 0x1A;
 
     // Caller holds mutex_.
     Display* FindLocked(const std::wstring& stableId) {
@@ -1253,7 +1393,25 @@ class Engine {
         wmi_->SetStopFlag(&stopping_);
         wmi_->Init();
 
+        LoadWhitePointState();
         Rescan();
+
+        // Re-apply persisted Reduce White Point state (e.g. after ShellHost.exe
+        // was recycled by Windows while idle).
+        {
+            std::vector<std::wstring> toApply;
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                for (const auto& d : displays_) {
+                    if (d.whitePointReduced) {
+                        toApply.push_back(d.stableId);
+                    }
+                }
+            }
+            for (const auto& id : toApply) {
+                ApplyWhitePoint(id, true);
+            }
+        }
 
         {
             std::lock_guard<std::mutex> lock(mutex_);
@@ -1294,29 +1452,46 @@ class Engine {
             std::map<std::wstring, int> contrastBatch;
             std::map<std::wstring, bool> powerBatch;
             std::map<std::pair<std::wstring, BYTE>, DWORD> vcpBatch;
+            std::map<std::wstring, bool> whitePointBatch;
             bool doRescan = false;
             bool doRefresh = false;
+            bool schedEnabled = false;
+            int schedStartMin = 20 * 60;
+            int schedEndMin = 5 * 60;
+            bool schedEvalImmediate = false;
             {
                 std::unique_lock<std::mutex> lock(mutex_);
-                work_.wait(lock, [this] {
+                auto hasWork = [this] {
                     return quit_ || rescan_ || refresh_ || !pending_.empty() ||
                            !pendingContrast_.empty() || !pendingPower_.empty() ||
-                           !pendingVcp_.empty();
-                });
+                           !pendingVcp_.empty() || !pendingWhitePoint_.empty() ||
+                           whitePointScheduleEvalImmediate_;
+                };
+                if (whitePointScheduleEnabled_) {
+                    work_.wait_for(lock, std::chrono::seconds(20), hasWork);
+                } else {
+                    work_.wait(lock, hasWork);
+                }
                 if (quit_) {
                     break;
                 }
                 doRescan = std::exchange(rescan_, false);
+                schedEnabled = whitePointScheduleEnabled_;
+                schedStartMin = whitePointScheduleStartMin_;
+                schedEndMin = whitePointScheduleEndMin_;
+                schedEvalImmediate = std::exchange(whitePointScheduleEvalImmediate_, false);
                 batch.swap(pending_);
                 contrastBatch.swap(pendingContrast_);
                 powerBatch.swap(pendingPower_);
                 vcpBatch.swap(pendingVcp_);
+                whitePointBatch.swap(pendingWhitePoint_);
                 // Never read back while writes are still queued: the value in
                 // flight has not reached the panel yet, so reading now would
                 // yank the slider backwards under the user's finger. refresh_
                 // stays set and we come back to it once the queue drains.
                 doRefresh = batch.empty() && contrastBatch.empty() &&
-                            powerBatch.empty() && vcpBatch.empty() && refresh_;
+                            powerBatch.empty() && vcpBatch.empty() &&
+                            whitePointBatch.empty() && refresh_;
                 if (doRefresh) {
                     refresh_ = false;
                 }
@@ -1356,6 +1531,18 @@ class Engine {
                     wroteDdc = true;
                 }
             }
+            for (const auto& entry : whitePointBatch) {
+                if (ApplyWhitePoint(entry.first, entry.second)) {
+                    wroteDdc = true;
+                }
+            }
+
+            if (schedEnabled) {
+                if (EvaluateWhitePointSchedule(schedStartMin, schedEndMin,
+                                               schedEvalImmediate)) {
+                    wroteDdc = true;
+                }
+            }
 
             // Breathing room after an I2C write, and it is not politeness.
             //
@@ -1378,6 +1565,17 @@ class Engine {
 
             if (doRefresh) {
                 RefreshValues();
+                // Ensure Magnification stays applied if DWM/UAC/display sleep reset it.
+                if (magInitialized_ && !magActiveDisplays_.empty()) {
+                    double scale = 0.30;
+                    {
+                        std::lock_guard<std::mutex> lock(mutex_);
+                        scale = static_cast<double>(
+                                    std::clamp(100 - whitePointReducePercent_, 1, 95)) /
+                                100.0;
+                    }
+                    UpdateMagnificationWhitePoint(scale, true);
+                }
                 NotifyChanged(false);
 
                 // Opening the panel is the moment a missing slider is
@@ -1392,6 +1590,7 @@ class Engine {
             }
         }
 
+        RestoreAllWhitePoint();
         ReleasePhysicalMonitors();
 
         // Tear down the WMI interfaces on the thread that created them, while
@@ -1888,6 +2087,7 @@ class Engine {
             }
 
             Display d;
+            d.gdiDeviceName = mi.szDevice;
             d.rect = mi.rcMonitor;
 
             DISPLAY_DEVICEW dd{};
@@ -2000,6 +2200,10 @@ class Engine {
 
         {
             std::lock_guard<std::mutex> lock(mutex_);
+            // Preserve Reduce White Point state across rescans.
+            for (auto& d : found) {
+                d.whitePointReduced = whitePointReducedIds_.count(d.stableId) > 0;
+            }
             // Drop accumulators for displays that are no longer here, so a
             // monitor that comes back does not inherit an offset from an
             // earlier session of itself.
@@ -2015,6 +2219,21 @@ class Engine {
             }
 
             displays_ = std::move(found);
+        }
+
+        // Magnification caches the monitor topology at MagInitialize() time.
+        // When a display is hotplugged (e.g. opening a laptop lid), re-init
+        // Magnification and re-apply the effect so the new display is covered.
+        if (magInitialized_ && !magActiveDisplays_.empty()) {
+            double scale = 0.30;
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                scale = static_cast<double>(
+                            std::clamp(100 - whitePointReducePercent_, 1, 95)) /
+                        100.0;
+            }
+            UpdateMagnificationWhitePoint(1.0, false);
+            UpdateMagnificationWhitePoint(scale, true);
         }
     }
 
@@ -2141,6 +2360,144 @@ class Engine {
         return true;
     }
 
+    static constexpr wchar_t kWhitePointParentRegPath[] =
+        L"Software\\Windhawk\\PerMonitorBrightness";
+    static constexpr wchar_t kWhitePointRegPath[] =
+        L"Software\\Windhawk\\PerMonitorBrightness\\WhitePoint";
+
+    static int CurrentLocalMinutes() {
+        SYSTEMTIME st{};
+        GetLocalTime(&st);
+        return static_cast<int>(st.wHour) * 60 + static_cast<int>(st.wMinute);
+    }
+
+    static bool IsInWhitePointSchedule(int nowMin, int startMin, int endMin) {
+        if (startMin == endMin) {
+            return false;
+        }
+        if (startMin < endMin) {
+            return nowMin >= startMin && nowMin < endMin;
+        }
+        return nowMin >= startMin || nowMin < endMin;
+    }
+
+    static std::optional<bool> LoadScheduleLastInWindow() {
+        HKEY key = nullptr;
+        if (RegOpenKeyExW(HKEY_CURRENT_USER, kWhitePointParentRegPath, 0,
+                          KEY_QUERY_VALUE, &key) != ERROR_SUCCESS) {
+            return std::nullopt;
+        }
+        DWORD val = 0;
+        DWORD size = sizeof(val);
+        DWORD type = 0;
+        LONG r = RegQueryValueExW(key, L"ScheduleLastInWindow", nullptr, &type,
+                                  reinterpret_cast<BYTE*>(&val), &size);
+        RegCloseKey(key);
+        if (r == ERROR_SUCCESS && type == REG_DWORD) {
+            return val != 0;
+        }
+        return std::nullopt;
+    }
+
+    static void SaveScheduleLastInWindow(bool inWindow) {
+        HKEY key = nullptr;
+        if (RegCreateKeyExW(HKEY_CURRENT_USER, kWhitePointParentRegPath, 0,
+                            nullptr, 0, KEY_SET_VALUE, nullptr, &key,
+                            nullptr) != ERROR_SUCCESS) {
+            return;
+        }
+        DWORD val = inWindow ? 1 : 0;
+        RegSetValueExW(key, L"ScheduleLastInWindow", 0, REG_DWORD,
+                       reinterpret_cast<const BYTE*>(&val), sizeof(val));
+        RegCloseKey(key);
+    }
+
+    bool EvaluateWhitePointSchedule(int startMin, int endMin, bool immediate) {
+        if (!whitePointScheduleLastInWindow_.has_value()) {
+            whitePointScheduleLastInWindow_ = LoadScheduleLastInWindow();
+        }
+        bool inWindow = IsInWhitePointSchedule(CurrentLocalMinutes(), startMin, endMin);
+        if (!immediate && whitePointScheduleLastInWindow_.has_value() &&
+            *whitePointScheduleLastInWindow_ == inWindow) {
+            return false;
+        }
+        whitePointScheduleLastInWindow_ = inWindow;
+        SaveScheduleLastInWindow(inWindow);
+
+        std::vector<std::wstring> targetIds;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            for (auto& d : displays_) {
+                if (d.whitePointReduced != inWindow) {
+                    d.whitePointReduced = inWindow;
+                    if (inWindow) {
+                        whitePointReducedIds_.insert(d.stableId);
+                    } else {
+                        whitePointReducedIds_.erase(d.stableId);
+                    }
+                    SaveWhitePointEntry(d.stableId, inWindow);
+                    targetIds.push_back(d.stableId);
+                }
+            }
+        }
+        if (targetIds.empty()) {
+            return false;
+        }
+        bool wroteDdc = false;
+        for (const auto& id : targetIds) {
+            if (ApplyWhitePoint(id, inWindow)) {
+                wroteDdc = true;
+            }
+        }
+        Log(L"white point schedule %ls (%zu displays)",
+            inWindow ? L"ON" : L"OFF", targetIds.size());
+        NotifyChanged(false);
+        return wroteDdc;
+    }
+
+    static void SaveWhitePointEntry(const std::wstring& stableId, bool reduced) {
+        HKEY key = nullptr;
+        if (RegCreateKeyExW(HKEY_CURRENT_USER, kWhitePointRegPath, 0, nullptr,
+                            0, KEY_SET_VALUE, nullptr, &key, nullptr) != ERROR_SUCCESS) {
+            return;
+        }
+        if (reduced) {
+            DWORD val = 1;
+            RegSetValueExW(key, stableId.c_str(), 0, REG_DWORD,
+                           reinterpret_cast<const BYTE*>(&val), sizeof(val));
+        } else {
+            RegDeleteValueW(key, stableId.c_str());
+        }
+        RegCloseKey(key);
+    }
+
+    void LoadWhitePointState() {
+        HKEY key = nullptr;
+        if (RegOpenKeyExW(HKEY_CURRENT_USER, kWhitePointRegPath, 0,
+                          KEY_QUERY_VALUE, &key) != ERROR_SUCCESS) {
+            return;
+        }
+        std::set<std::wstring> loaded;
+        wchar_t name[512];
+        for (DWORD idx = 0;; ++idx) {
+            DWORD nameLen = ARRAYSIZE(name);
+            DWORD type = 0;
+            DWORD val = 0;
+            DWORD valSize = sizeof(val);
+            LONG r = RegEnumValueW(key, idx, name, &nameLen, nullptr, &type,
+                                   reinterpret_cast<BYTE*>(&val), &valSize);
+            if (r == ERROR_NO_MORE_ITEMS) {
+                break;
+            }
+            if (r == ERROR_SUCCESS && type == REG_DWORD && val != 0 && nameLen > 0) {
+                loaded.emplace(name, nameLen);
+            }
+        }
+        RegCloseKey(key);
+        std::lock_guard<std::mutex> lock(mutex_);
+        whitePointReducedIds_.insert(loaded.begin(), loaded.end());
+    }
+
     bool ApplyPower(const std::wstring& stableId, bool on) {
         HANDLE hPhysical = DdcHandleFor(stableId);
         if (!hPhysical || !DisplayField(stableId, &Display::hasPower, false)) {
@@ -2151,6 +2508,319 @@ class Engine {
         Log(L"power %ls -> %ls ok=%d", stableId.c_str(), on ? L"on" : L"off",
             ok ? 1 : 0);
         return true;
+    }
+
+    // Queries Windows DisplayConfig to see whether HDR / Advanced Color is
+    // currently active on the given GDI display device (e.g. "\\.\DISPLAY5").
+    // When HDR is active, DWM manages the 16-bit scRGB pipeline and ignores
+    // legacy GDI SetDeviceGammaRamp calls.
+    static bool IsHdrEnabled(const std::wstring& gdiDeviceName) {
+        if (gdiDeviceName.empty()) {
+            return false;
+        }
+        UINT32 numPaths = 0, numModes = 0;
+        if (GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &numPaths, &numModes) !=
+                ERROR_SUCCESS ||
+            numPaths == 0) {
+            return false;
+        }
+        std::vector<DISPLAYCONFIG_PATH_INFO> paths(numPaths);
+        std::vector<DISPLAYCONFIG_MODE_INFO> modes(numModes);
+        if (QueryDisplayConfig(QDC_ONLY_ACTIVE_PATHS, &numPaths, paths.data(),
+                               &numModes, modes.data(), nullptr) != ERROR_SUCCESS) {
+            return false;
+        }
+        for (UINT32 i = 0; i < numPaths; ++i) {
+            DISPLAYCONFIG_SOURCE_DEVICE_NAME srcName{};
+            srcName.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME;
+            srcName.header.size = sizeof(srcName);
+            srcName.header.adapterId = paths[i].sourceInfo.adapterId;
+            srcName.header.id = paths[i].sourceInfo.id;
+            if (DisplayConfigGetDeviceInfo(&srcName.header) != ERROR_SUCCESS) {
+                continue;
+            }
+            if (_wcsicmp(srcName.viewGdiDeviceName, gdiDeviceName.c_str()) != 0) {
+                continue;
+            }
+            // DISPLAYCONFIG_DEVICE_INFO_GET_ADVANCED_COLOR_INFO == 9
+            struct AdvColorInfo {
+                DISPLAYCONFIG_DEVICE_INFO_HEADER header;
+                UINT32 value;
+                UINT32 colorEncoding;
+                INT32 bitsPerColorChannel;
+            } adv{};
+            adv.header.type = static_cast<DISPLAYCONFIG_DEVICE_INFO_TYPE>(9);
+            adv.header.size = sizeof(adv);
+            adv.header.adapterId = paths[i].targetInfo.adapterId;
+            adv.header.id = paths[i].targetInfo.id;
+            if (DisplayConfigGetDeviceInfo(&adv.header) == ERROR_SUCCESS) {
+                // bit 1 (0x2) is advancedColorEnabled
+                return (adv.value & 0x2u) != 0;
+            }
+        }
+        return false;
+    }
+
+    bool ApplyGammaRampWhitePoint(const std::wstring& stableId,
+                                  const std::wstring& gdiDevice, double scale) {
+        if (gdiDevice.empty()) {
+            return false;
+        }
+        HDC hdc = CreateDCW(nullptr, gdiDevice.c_str(), nullptr, nullptr);
+        if (!hdc) {
+            return false;
+        }
+        auto it = savedGammaRamps_.find(stableId);
+        if (it == savedGammaRamps_.end()) {
+            std::array<WORD, 256 * 3> orig{};
+            if (!GetDeviceGammaRamp(hdc, orig.data())) {
+                DeleteDC(hdc);
+                return false;
+            }
+            it = savedGammaRamps_.emplace(stableId, orig).first;
+        }
+        std::array<WORD, 256 * 3> ramp{};
+        for (size_t i = 0; i < ramp.size(); ++i) {
+            long val = std::lround(static_cast<double>(it->second[i]) * scale);
+            ramp[i] = static_cast<WORD>(std::clamp(val, 0L, 65535L));
+        }
+        bool ok = SetDeviceGammaRamp(hdc, ramp.data()) != FALSE;
+        DeleteDC(hdc);
+        if (!ok && savedGammaRamps_.count(stableId)) {
+            savedGammaRamps_.erase(stableId);
+        }
+        Log(L"whitePoint gamma %ls (%ls) scale=%.2f ok=%d", stableId.c_str(),
+            gdiDevice.c_str(), scale, ok ? 1 : 0);
+        return ok;
+    }
+
+    void RestoreGammaRampWhitePoint(const std::wstring& stableId,
+                                    const std::wstring& gdiDevice) {
+        auto it = savedGammaRamps_.find(stableId);
+        if (it == savedGammaRamps_.end()) {
+            return;
+        }
+        if (!gdiDevice.empty()) {
+            if (HDC hdc = CreateDCW(nullptr, gdiDevice.c_str(), nullptr, nullptr)) {
+                SetDeviceGammaRamp(hdc, it->second.data());
+                DeleteDC(hdc);
+            }
+        }
+        savedGammaRamps_.erase(it);
+    }
+
+    bool ApplyDdcRgbGainWhitePoint(const std::wstring& stableId, HANDLE hPhysical,
+                                   double scale) {
+        if (!hPhysical) {
+            return false;
+        }
+        auto it = savedRgbGain_.find(stableId);
+        if (it == savedRgbGain_.end()) {
+            MC_VCP_CODE_TYPE type{};
+            RgbGainState base{};
+            if (!GetVCPFeatureAndVCPFeatureReply(hPhysical, kVcpRedGain, &type,
+                                                 &base.rCur, &base.rMax) ||
+                !GetVCPFeatureAndVCPFeatureReply(hPhysical, kVcpGreenGain, &type,
+                                                 &base.gCur, &base.gMax) ||
+                !GetVCPFeatureAndVCPFeatureReply(hPhysical, kVcpBlueGain, &type,
+                                                 &base.bCur, &base.bMax) ||
+                base.rMax == 0 || base.gMax == 0 || base.bMax == 0) {
+                return false;
+            }
+            it = savedRgbGain_.emplace(stableId, base).first;
+        }
+        const RgbGainState& base = it->second;
+        DWORD r = static_cast<DWORD>(std::lround(base.rCur * scale));
+        DWORD g = static_cast<DWORD>(std::lround(base.gCur * scale));
+        DWORD b = static_cast<DWORD>(std::lround(base.bCur * scale));
+        bool ok = SetVCPFeature(hPhysical, kVcpRedGain, r) &&
+                  SetVCPFeature(hPhysical, kVcpGreenGain, g) &&
+                  SetVCPFeature(hPhysical, kVcpBlueGain, b);
+        if (ok && r != base.rCur) {
+            // Some monitors (e.g. in HDR mode) return TRUE for SetVCPFeature
+            // while ignoring the write. Read back Red gain to verify it took.
+            MC_VCP_CODE_TYPE type{};
+            DWORD rb = 0, rbMax = 0;
+            if (!GetVCPFeatureAndVCPFeatureReply(hPhysical, kVcpRedGain, &type, &rb, &rbMax) ||
+                rb == base.rCur) {
+                ok = false;
+            }
+        }
+        Log(L"whitePoint ddcRgb %ls -> (%lu,%lu,%lu) ok=%d", stableId.c_str(),
+            r, g, b, ok ? 1 : 0);
+        if (!ok) {
+            RestoreDdcRgbGainWhitePoint(stableId, hPhysical);
+        }
+        return ok;
+    }
+
+    bool RestoreDdcRgbGainWhitePoint(const std::wstring& stableId, HANDLE hPhysical) {
+        auto it = savedRgbGain_.find(stableId);
+        if (it == savedRgbGain_.end()) {
+            return false;
+        }
+        const RgbGainState base = it->second;
+        savedRgbGain_.erase(it);
+        if (!hPhysical) {
+            return false;
+        }
+        SetVCPFeature(hPhysical, kVcpRedGain, base.rCur);
+        SetVCPFeature(hPhysical, kVcpGreenGain, base.gCur);
+        SetVCPFeature(hPhysical, kVcpBlueGain, base.bCur);
+        return true;
+    }
+
+    bool UpdateMagnificationWhitePoint(double scale, bool active) {
+        struct MagColorEffect {
+            float transform[5][5];
+        };
+        using MagInitFn = BOOL(WINAPI*)();
+        using MagUninitFn = BOOL(WINAPI*)();
+        using MagSetFxFn = BOOL(WINAPI*)(MagColorEffect*);
+
+        if (!magModule_) {
+            if (!active) {
+                return true;
+            }
+            magModule_ = LoadLibraryW(L"Magnification.dll");
+            if (!magModule_) {
+                Log(L"whitePoint magnification: LoadLibrary failed (%u)",
+                    GetLastError());
+                return false;
+            }
+        }
+        auto magInit = reinterpret_cast<MagInitFn>(
+            GetProcAddress(magModule_, "MagInitialize"));
+        auto magUninit = reinterpret_cast<MagUninitFn>(
+            GetProcAddress(magModule_, "MagUninitialize"));
+        auto magSetFx = reinterpret_cast<MagSetFxFn>(
+            GetProcAddress(magModule_, "MagSetFullscreenColorEffect"));
+        if (!magInit || !magUninit || !magSetFx) {
+            return false;
+        }
+        if (active) {
+            if (!magInitialized_) {
+                magInitialized_ = (magInit() != FALSE);
+                if (!magInitialized_) {
+                    Log(L"whitePoint MagInitialize failed (%u)", GetLastError());
+                    return false;
+                }
+            }
+            const float s = static_cast<float>(scale);
+            MagColorEffect fx{};
+            fx.transform[0][0] = s;
+            fx.transform[1][1] = s;
+            fx.transform[2][2] = s;
+            fx.transform[3][3] = 1.0f;
+            fx.transform[4][4] = 1.0f;
+            bool ok = magSetFx(&fx) != FALSE;
+            Log(L"whitePoint magnification scale=%.2f ok=%d", scale, ok ? 1 : 0);
+            return ok;
+        } else {
+            if (magInitialized_) {
+                MagColorEffect identity{};
+                identity.transform[0][0] = 1.0f;
+                identity.transform[1][1] = 1.0f;
+                identity.transform[2][2] = 1.0f;
+                identity.transform[3][3] = 1.0f;
+                identity.transform[4][4] = 1.0f;
+                magSetFx(&identity);
+                magUninit();
+                magInitialized_ = false;
+            }
+            return true;
+        }
+    }
+
+    // Returns whether a DDC/CI write occurred (for kDdcCooldown).
+    bool ApplyWhitePoint(const std::wstring& stableId, bool reduce) {
+        Transport transport = Transport::None;
+        HANDLE hPhysical = nullptr;
+        std::wstring gdiDevice;
+        int reducePercent = 70;
+        WhitePointMethod method = WhitePointMethod::Auto;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            reducePercent = whitePointReducePercent_;
+            method = whitePointMethod_;
+            if (const Display* d = FindLocked(stableId)) {
+                transport = d->transport;
+                hPhysical = d->hPhysical;
+                gdiDevice = d->gdiDeviceName;
+            }
+        }
+        if (!reduce) {
+            bool wroteDdc = RestoreDdcRgbGainWhitePoint(stableId, hPhysical);
+            RestoreGammaRampWhitePoint(stableId, gdiDevice);
+            magActiveDisplays_.erase(stableId);
+            if (magActiveDisplays_.empty() && magInitialized_) {
+                UpdateMagnificationWhitePoint(1.0, false);
+            }
+            return wroteDdc;
+        }
+
+        const double scale =
+            static_cast<double>(std::clamp(100 - reducePercent, 1, 95)) / 100.0;
+        const bool hdr = IsHdrEnabled(gdiDevice);
+        bool wroteDdc = false;
+        bool applied = false;
+
+        if (method == WhitePointMethod::DdcRgbGain ||
+            (method == WhitePointMethod::Auto && !hdr &&
+             transport == Transport::DdcCi)) {
+            if (ApplyDdcRgbGainWhitePoint(stableId, hPhysical, scale)) {
+                wroteDdc = true;
+                applied = true;
+            }
+        }
+        if (!applied && !hdr &&
+            (method == WhitePointMethod::GammaRamp ||
+             method == WhitePointMethod::Auto)) {
+            if (ApplyGammaRampWhitePoint(stableId, gdiDevice, scale)) {
+                applied = true;
+            } else if (method == WhitePointMethod::GammaRamp && scale < 0.50) {
+                // Windows win32k rejects SetDeviceGammaRamp below ~50%; clamp
+                // when GammaRamp is explicitly selected.
+                applied = ApplyGammaRampWhitePoint(stableId, gdiDevice, 0.50);
+            }
+        }
+        if (!applied && (method == WhitePointMethod::Magnification ||
+                         method == WhitePointMethod::Auto)) {
+            if (UpdateMagnificationWhitePoint(scale, true)) {
+                magActiveDisplays_.insert(stableId);
+                applied = true;
+            }
+        }
+        if (!applied) {
+            Log(L"whitePoint %ls: no supported method succeeded",
+                stableId.c_str());
+        }
+        return wroteDdc;
+    }
+
+    void RestoreAllWhitePoint() {
+        std::vector<std::tuple<std::wstring, HANDLE, std::wstring>> targets;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            for (const auto& d : displays_) {
+                targets.emplace_back(d.stableId, d.hPhysical, d.gdiDeviceName);
+            }
+        }
+        for (const auto& t : targets) {
+            RestoreDdcRgbGainWhitePoint(std::get<0>(t), std::get<1>(t));
+            RestoreGammaRampWhitePoint(std::get<0>(t), std::get<2>(t));
+        }
+        // Also restore any disconnected/untracked gamma ramps by key if possible.
+        savedGammaRamps_.clear();
+        savedRgbGain_.clear();
+        magActiveDisplays_.clear();
+        if (magInitialized_) {
+            UpdateMagnificationWhitePoint(1.0, false);
+        }
+        if (magModule_) {
+            FreeLibrary(magModule_);
+            magModule_ = nullptr;
+        }
     }
 
     Transport Apply(const std::wstring& stableId, int percent) {
@@ -2222,6 +2892,27 @@ class Engine {
     std::map<std::wstring, int> pendingContrast_;
     std::map<std::wstring, bool> pendingPower_;
     std::map<std::pair<std::wstring, BYTE>, DWORD> pendingVcp_;
+    std::map<std::wstring, bool> pendingWhitePoint_;
+    std::set<std::wstring> whitePointReducedIds_;
+    int whitePointReducePercent_ = 70;
+    WhitePointMethod whitePointMethod_ = WhitePointMethod::Auto;
+    bool whitePointScheduleEnabled_ = false;
+    int whitePointScheduleStartMin_ = 20 * 60;
+    int whitePointScheduleEndMin_ = 5 * 60;
+    bool whitePointScheduleEvalImmediate_ = false;
+    std::optional<bool> whitePointScheduleLastInWindow_;
+
+    // Worker-thread-only saved baselines for Reduce White Point.
+    struct RgbGainState {
+        DWORD rCur = 0, rMax = 0;
+        DWORD gCur = 0, gMax = 0;
+        DWORD bCur = 0, bMax = 0;
+    };
+    std::map<std::wstring, RgbGainState> savedRgbGain_;
+    std::map<std::wstring, std::array<WORD, 256 * 3>> savedGammaRamps_;
+    std::set<std::wstring> magActiveDisplays_;
+    HMODULE magModule_ = nullptr;
+    bool magInitialized_ = false;
     // Capabilities read this session, by display, and how many reads have
     // failed for the ones not read yet. Worker thread only.
     static constexpr int kCapsAttempts = 3;
@@ -2340,6 +3031,7 @@ struct Injection {
         std::wstring name;
         winrt::weak_ref<wuxc::Slider> slider;
         winrt::weak_ref<wux::FrameworkElement> icon;
+        winrt::weak_ref<wux::FrameworkElement> iconHost;
         std::shared_ptr<RowTitle> title;
         // Null when the row has none.
         winrt::weak_ref<wuxc::Slider> contrast;
@@ -2485,6 +3177,10 @@ int g_scrollStep = 5;
 // Clicking a slider's icon jumps it to a level: left, middle, right button.
 bool g_iconClicks = false;
 int g_iconClickLevels[3] = {0, 50, 100};
+// Left-clicking a brightness icon toggles Reduce White Point.
+bool g_whitePointOnIconClick = true;
+int g_whitePointReducePercent = 70;
+brightness::WhitePointMethod g_whitePointMethod = brightness::WhitePointMethod::Auto;
 // Settings for individual displays. The first rule whose text appears in a
 // display's name or device id applies to it. Written only while no panel
 // exists -- a settings change reloads the mod rather than editing this live.
@@ -3185,6 +3881,7 @@ void SetIconLevel(wux::FrameworkElement const& icon, double percent) {
 struct RowTitle {
     std::wstring name;
     wuxc::TextBlock text{nullptr};
+    bool whitePointReduced = false;
     struct Entry {
         winrt::weak_ref<wuxc::Slider> slider;
         bool inDetails;
@@ -3212,6 +3909,9 @@ void UpdateRowTitle(RowTitle const& row) {
         if (auto slider = entry.slider.get()) {
             out += L"  ·  " + std::to_wstring(std::lround(slider.Value())) + L"%";
         }
+    }
+    if (row.whitePointReduced) {
+        out += L"  ·  Dimmed";
     }
     row.text.Text(out);
 }
@@ -3295,6 +3995,7 @@ wux::FrameworkElement MakeContrastIcon() {
     wuxc::FontIcon font;
     font.FontFamily(wuxm::FontFamily(L"Segoe Fluent Icons"));
     font.Glyph(L"\xE7A1");  // Contrast
+    font.FontSize(14);
     font.Width(kIconSize);
     font.Height(kIconSize);
     return font;
@@ -3437,11 +4138,28 @@ void AttachWheel(wuxc::Slider const& slider, Injection& injection) {
         }));
 }
 
+void UpdateWhitePointIconState(wux::FrameworkElement const& host, bool reduced) {
+    if (!host) {
+        return;
+    }
+    host.Opacity(reduced ? 0.55 : 1.0);
+    std::wstring tip = reduced
+        ? L"Reduce White Point: ON (-" + std::to_wstring(g_whitePointReducePercent) + L"%)\nClick to turn off"
+        : L"Click to reduce white point (-" + std::to_wstring(g_whitePointReducePercent) + L"%)";
+    wuxc::ToolTipService::SetToolTip(host, winrt::box_value(winrt::hstring{tip}));
+}
+
 // Clicking a slider's icon jumps it to a level: left, middle and right
-// button each have their own (issue #5697). The icon sits in a Border with a
-// transparent background, since a glyph only hit-tests where it has ink.
+// button each have their own (issue #5697). For brightness icons, left-click
+// can also toggle Reduce White Point when g_whitePointOnIconClick is enabled.
+// The icon sits in a Border with a transparent background, since a glyph only
+// hit-tests where it has ink.
 wux::FrameworkElement MakeIconHost(wux::FrameworkElement const& icon,
-                                   wuxc::Slider const& slider, Injection& injection) {
+                                   wuxc::Slider const& slider, Injection& injection,
+                                   bool isBrightness = false,
+                                   const std::wstring& displayId = L"",
+                                   std::shared_ptr<RowTitle> rowTitle = nullptr,
+                                   std::shared_ptr<PanelLinks> masterLinks = nullptr) {
     wuxc::Border host;
     host.Background(wuxm::SolidColorBrush(winrt::Windows::UI::Colors::Transparent()));
     host.VerticalAlignment(wux::VerticalAlignment::Center);
@@ -3452,10 +4170,17 @@ wux::FrameworkElement MakeIconHost(wux::FrameworkElement const& icon,
     icon.HorizontalAlignment(wux::HorizontalAlignment::Center);
     icon.VerticalAlignment(wux::VerticalAlignment::Center);
     host.Child(icon);
-    if (g_iconClicks) {
+
+    if (isBrightness && g_whitePointOnIconClick && rowTitle) {
+        UpdateWhitePointIconState(host, rowTitle->whitePointReduced);
+    }
+
+    const bool handleWhitePoint = isBrightness && g_whitePointOnIconClick;
+    if (g_iconClicks || handleWhitePoint) {
         injection.pressRevokers.push_back(host.PointerPressed(
             winrt::auto_revoke,
-            [weakHost = winrt::make_weak(host), weakSlider = winrt::make_weak(slider)](
+            [weakHost = winrt::make_weak(host), weakSlider = winrt::make_weak(slider),
+             handleWhitePoint, displayId, rowTitle, masterLinks](
                 wf::IInspectable const&, wux::Input::PointerRoutedEventArgs const& args) {
                 auto h = weakHost.get();
                 auto s = weakSlider.get();
@@ -3463,6 +4188,41 @@ wux::FrameworkElement MakeIconHost(wux::FrameworkElement const& icon,
                     return;
                 }
                 auto props = args.GetCurrentPoint(h).Properties();
+                if (handleWhitePoint && props.IsLeftButtonPressed() && g_engine) {
+                    if (!displayId.empty()) {
+                        bool next = g_engine->ToggleWhitePointReduced(displayId);
+                        if (rowTitle) {
+                            rowTitle->whitePointReduced = next;
+                            UpdateRowTitle(*rowTitle);
+                        }
+                        UpdateWhitePointIconState(h, next);
+                    } else if (masterLinks) {
+                        std::vector<brightness::Display> displays = g_engine->GetDisplays();
+                        bool anyOff = false;
+                        for (const auto& d : displays) {
+                            if (Contains(masterLinks->brightnessIds, d.stableId) &&
+                                !d.whitePointReduced) {
+                                anyOff = true;
+                                break;
+                            }
+                        }
+                        for (const std::wstring& id : masterLinks->brightnessIds) {
+                            g_engine->SetWhitePointReduced(id, anyOff);
+                        }
+                        if (rowTitle) {
+                            rowTitle->whitePointReduced = anyOff;
+                            UpdateRowTitle(*rowTitle);
+                        }
+                        UpdateWhitePointIconState(h, anyOff);
+                        // Request a lightweight UI sync for per-display rows.
+                        g_engine->RequestRefresh();
+                    }
+                    args.Handled(true);
+                    return;
+                }
+                if (!g_iconClicks) {
+                    return;
+                }
                 int level = -1;
                 if (props.IsLeftButtonPressed()) {
                     level = g_iconClickLevels[0];
@@ -3796,8 +4556,18 @@ void PopulateSliderPanel(wuxc::StackPanel const& panel, Injection& injection) {
             wux::FrameworkElement icon = MakeBrightnessIcon();
             wuxc::Slider slider = MakeSlider(average < 0 ? 50 : average, 1.0);
             SetIconLevel(icon, slider.Value());
-            panel.Children().Append(
-                MakeSliderRow(MakeIconHost(icon, slider, injection), slider, nullptr, trailing));
+            bool allReduced = !links->brightnessIds.empty();
+            for (const auto& d : displays) {
+                if (Contains(links->brightnessIds, d.stableId) && !d.whitePointReduced) {
+                    allReduced = false;
+                    break;
+                }
+            }
+            rowTitle->whitePointReduced = allReduced;
+            panel.Children().Append(MakeSliderRow(
+                MakeIconHost(icon, slider, injection, /*isBrightness=*/true, L"",
+                             rowTitle, links),
+                slider, nullptr, trailing));
             links->masterBrightness = winrt::make_weak(slider);
             rowTitle->sliders.push_back({winrt::make_weak(slider), false});
             AttachWheel(slider, injection);
@@ -3947,6 +4717,7 @@ void PopulateSliderPanel(wuxc::StackPanel const& panel, Injection& injection) {
         auto rowTitle = std::make_shared<RowTitle>();
         rowTitle->name = displayName;
         rowTitle->text = title;
+        rowTitle->whitePointReduced = d.whitePointReduced;
         // The device id, for telling identical monitors apart when naming
         // them: the part after the last "&" names the output it is plugged
         // into.
@@ -4012,7 +4783,10 @@ void PopulateSliderPanel(wuxc::StackPanel const& panel, Injection& injection) {
         }
 
         std::wstring id = d.stableId;
-        Injection::Binding binding{id, displayName, {}, {}, rowTitle};
+        Injection::Binding binding;
+        binding.id = id;
+        binding.name = displayName;
+        binding.title = rowTitle;
 
         // The brightness row, and the power button that sits at its end.
         if (g_showPerMonitor) {
@@ -4032,8 +4806,9 @@ void PopulateSliderPanel(wuxc::StackPanel const& panel, Injection& injection) {
                 !(rule && rule->hidePower)) {
                 power = MakePowerButton(d, displayName, injection, links);
             }
-            panel.Children().Append(MakeSliderRow(MakeIconHost(icon, slider, injection), slider,
-                                                  power, trailing));
+            wux::FrameworkElement iconHost = MakeIconHost(
+                icon, slider, injection, /*isBrightness=*/true, id, rowTitle);
+            panel.Children().Append(MakeSliderRow(iconHost, slider, power, trailing));
             AttachWheel(slider, injection);
 
             // auto_revoke so the handler can be detached on unload; a dangling
@@ -4062,6 +4837,7 @@ void PopulateSliderPanel(wuxc::StackPanel const& panel, Injection& injection) {
 
             binding.slider = winrt::make_weak(slider);
             binding.icon = winrt::make_weak(icon);
+            binding.iconHost = winrt::make_weak(iconHost);
         }
 
         // The extra rows go into the dropdown when there is one, straight into
@@ -5008,9 +5784,16 @@ void ApplyRefreshedValues() try {
                 }
             }
 
+            if (auto host = binding.iconHost.get()) {
+                if (g_whitePointOnIconClick) {
+                    UpdateWhitePointIconState(host, d->whitePointReduced);
+                }
+            }
+
             // The sliders' own handlers keep it current as they move; this
             // covers a title that was built before its values were read.
             if (binding.title) {
+                binding.title->whitePointReduced = d->whitePointReduced;
                 UpdateRowTitle(*binding.title);
             }
         }
@@ -5785,10 +6568,17 @@ struct ModSettings {
     int scrollStep = 5;
     bool iconClicks = false;
     int iconClickLevels[3] = {0, 50, 100};
+    bool whitePointOnIconClick = true;
+    int whitePointReducePercent = 70;
+    brightness::WhitePointMethod whitePointMethod = brightness::WhitePointMethod::Auto;
+    bool whitePointScheduleEnabled = false;
+    int whitePointScheduleStartMin = 20 * 60;
+    int whitePointScheduleEndMin = 5 * 60;
     std::vector<DisplayRule> displayRules;
 
-    // Everything but the follow mode changes what is in the shell's visual
-    // tree, which is put right by reloading rather than by patching it live.
+    // Everything but the follow mode and white point engine parameters changes
+    // what is in the shell's visual tree, which is put right by reloading
+    // rather than by patching it live.
     bool SameUi(const ModSettings& other) const {
         return hideStockBrightness == other.hideStockBrightness &&
                hideUnsupported == other.hideUnsupported &&
@@ -5802,6 +6592,7 @@ struct ModSettings {
                showVolume == other.showVolume &&
                showInputSwitcher == other.showInputSwitcher &&
                scrollStep == other.scrollStep && iconClicks == other.iconClicks &&
+               whitePointOnIconClick == other.whitePointOnIconClick &&
                std::equal(std::begin(iconClickLevels), std::end(iconClickLevels),
                           std::begin(other.iconClickLevels)) &&
                displayRules == other.displayRules;
@@ -5812,6 +6603,50 @@ struct ModSettings {
 ModSettings g_settings;
 
 ModSettings ReadSettings() {
+    auto parseTimeMinutes = [](const wchar_t* text, int fallbackMinutes) {
+        if (!text) {
+            return fallbackMinutes;
+        }
+        while (*text == L' ' || *text == L'\t') {
+            ++text;
+        }
+        int hh = 0;
+        int mm = 0;
+        int colonCount = 0;
+        bool hasHourDigit = false;
+        bool hasMinDigit = false;
+        for (const wchar_t* p = text; *p && *p != L' ' && *p != L'\t'; ++p) {
+            if (*p == L':') {
+                ++colonCount;
+                if (colonCount > 1 || !hasHourDigit) {
+                    return fallbackMinutes;
+                }
+                continue;
+            }
+            if (*p < L'0' || *p > L'9') {
+                return fallbackMinutes;
+            }
+            int d = *p - L'0';
+            if (colonCount == 0) {
+                hh = hh * 10 + d;
+                hasHourDigit = true;
+                if (hh > 23) {
+                    return fallbackMinutes;
+                }
+            } else {
+                mm = mm * 10 + d;
+                hasMinDigit = true;
+                if (mm > 59) {
+                    return fallbackMinutes;
+                }
+            }
+        }
+        if (colonCount != 1 || !hasHourDigit || !hasMinDigit) {
+            return fallbackMinutes;
+        }
+        return hh * 60 + mm;
+    };
+
     ModSettings out;
     out.hideStockBrightness = Wh_GetIntSetting(L"hideStockBrightness") != 0;
     out.hideUnsupported = Wh_GetIntSetting(L"hideUnsupported") != 0;
@@ -5854,6 +6689,25 @@ ModSettings ReadSettings() {
     out.iconClickLevels[0] = std::clamp(Wh_GetIntSetting(L"iconClickLeft"), 0, 100);
     out.iconClickLevels[1] = std::clamp(Wh_GetIntSetting(L"iconClickMiddle"), 0, 100);
     out.iconClickLevels[2] = std::clamp(Wh_GetIntSetting(L"iconClickRight"), 0, 100);
+    out.whitePointOnIconClick = Wh_GetIntSetting(L"whitePointOnIconClick") != 0;
+    int wpPct = Wh_GetIntSetting(L"whitePointReducePercent");
+    out.whitePointReducePercent = std::clamp(wpPct == 0 ? 70 : wpPct, 10, 99);
+    WindhawkUtils::StringSetting wpMethod =
+        WindhawkUtils::StringSetting::make(L"whitePointMethod");
+    if (wcscmp(wpMethod.get(), L"gamma") == 0) {
+        out.whitePointMethod = brightness::WhitePointMethod::GammaRamp;
+    } else if (wcscmp(wpMethod.get(), L"ddc") == 0) {
+        out.whitePointMethod = brightness::WhitePointMethod::DdcRgbGain;
+    } else if (wcscmp(wpMethod.get(), L"magnification") == 0) {
+        out.whitePointMethod = brightness::WhitePointMethod::Magnification;
+    }
+    out.whitePointScheduleEnabled = Wh_GetIntSetting(L"whitePointScheduleEnabled") != 0;
+    WindhawkUtils::StringSetting wpSchedStart =
+        WindhawkUtils::StringSetting::make(L"whitePointScheduleStart");
+    out.whitePointScheduleStartMin = parseTimeMinutes(wpSchedStart.get(), 20 * 60);
+    WindhawkUtils::StringSetting wpSchedEnd =
+        WindhawkUtils::StringSetting::make(L"whitePointScheduleEnd");
+    out.whitePointScheduleEndMin = parseTimeMinutes(wpSchedEnd.get(), 5 * 60);
 
     // A fixed bound rather than stopping at the first empty entry, so an
     // entry left blank in the middle of the list does not hide the ones after.
@@ -5894,9 +6748,17 @@ void ApplySettings(const ModSettings& settings) {
     g_iconClicks = settings.iconClicks;
     std::copy(std::begin(settings.iconClickLevels), std::end(settings.iconClickLevels),
               std::begin(g_iconClickLevels));
+    g_whitePointOnIconClick = settings.whitePointOnIconClick;
+    g_whitePointReducePercent = settings.whitePointReducePercent;
+    g_whitePointMethod = settings.whitePointMethod;
     g_displayRules = settings.displayRules;
     if (g_engine) {
         g_engine->SetFollowMode(settings.followMode);
+        g_engine->SetWhitePointConfig(settings.whitePointReducePercent,
+                                      settings.whitePointMethod);
+        g_engine->SetWhitePointSchedule(settings.whitePointScheduleEnabled,
+                                        settings.whitePointScheduleStartMin,
+                                        settings.whitePointScheduleEndMin);
     }
 
     Wh_Log(L"settings: hideStock=%d follow=%d position=%d hideUnsupported=%d "
@@ -5958,10 +6820,22 @@ BOOL Wh_ModSettingsChanged(BOOL* bReload) {
         return TRUE;
     }
 
-    // Follow mode is engine state and takes effect at once.
+    // Follow mode and white point parameters are engine state and take effect at once.
     g_settings.followMode = next.followMode;
+    g_settings.whitePointReducePercent = next.whitePointReducePercent;
+    g_settings.whitePointMethod = next.whitePointMethod;
+    g_settings.whitePointScheduleEnabled = next.whitePointScheduleEnabled;
+    g_settings.whitePointScheduleStartMin = next.whitePointScheduleStartMin;
+    g_settings.whitePointScheduleEndMin = next.whitePointScheduleEndMin;
+    g_whitePointReducePercent = next.whitePointReducePercent;
+    g_whitePointMethod = next.whitePointMethod;
     if (g_engine) {
         g_engine->SetFollowMode(next.followMode);
+        g_engine->SetWhitePointConfig(next.whitePointReducePercent,
+                                      next.whitePointMethod);
+        g_engine->SetWhitePointSchedule(next.whitePointScheduleEnabled,
+                                        next.whitePointScheduleStartMin,
+                                        next.whitePointScheduleEndMin);
     }
     *bReload = FALSE;
     return TRUE;
