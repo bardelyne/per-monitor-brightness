@@ -8,7 +8,7 @@
 // @include         ShellHost.exe
 // @architecture    x86-64
 // @license         GPL-3.0
-// @compilerOptions -ldxva2 -lole32 -loleaut32 -lwbemuuid -luuid -lruntimeobject
+// @compilerOptions -ldxva2 -lgdi32 -lole32 -loleaut32 -lwbemuuid -luuid -lruntimeobject
 // ==/WindhawkMod==
 
 // Source code is published under The GNU General Public License v3.0.
@@ -330,6 +330,48 @@ include stays off.
   $name: Middle click level
 - iconClickRight: 100
   $name: Right click level
+- whitePointOnIconClick: true
+  $name: Click brightness icon to toggle Reduce White Point
+  $description: >-
+    Left-clicking a display's brightness icon toggles Reduce White Point (software
+    dimming on top of the hardware brightness slider, similar to Apple's Reduce
+    White Point). Leaves the brightness slider's full 0-100% range usable at a
+    lower nit ceiling. Takes precedence over left-click level jump.
+- whitePointReducePercent: 70
+  $name: Reduce White Point level (%)
+  $description: >-
+    How much to reduce white point intensity when toggled on (10-99%). At 70%,
+    the display's effective brightness range scales down to 30% of normal.
+
+    Note: On backlit LCD panels (such as IPS/VA), software white point
+    reduction only dims pixel values and cannot lower the physical LED
+    backlight below its hardware minimum, so high values (80%+) may show
+    backlight bleed or washed-out blacks; OLED panels dim cleanly down to true
+    black.
+- whitePointMethod: auto
+  $name: Reduce White Point method
+  $description: >-
+    How Reduce White Point dims the display. "Auto" tries per-monitor DDC/CI
+    RGB gain on external monitors, per-monitor GPU gamma ramp in SDR, and falls
+    back to the DWM color matrix when HDR blocks gamma ramps.
+  $options:
+  - auto: Auto (per-monitor, HDR-aware)
+  - gamma: GPU gamma ramp (per-monitor, SDR)
+  - ddc: DDC/CI RGB gain (external monitors)
+  - magnification: DWM color matrix (works in HDR, all displays)
+- whitePointScheduleEnabled: false
+  $name: Schedule Reduce White Point
+  $description: >-
+    Automatically turn Reduce White Point on and off on all displays at
+    scheduled local times (for example, 20:00 to 05:00).
+- whitePointScheduleStart: "20:00"
+  $name: Schedule start time (HH:MM)
+  $description: >-
+    Local time in 24-hour HH:MM format to turn Reduce White Point on.
+- whitePointScheduleEnd: "05:00"
+  $name: Schedule end time (HH:MM)
+  $description: >-
+    Local time in 24-hour HH:MM format to turn Reduce White Point off.
 - displaySettings:
   - - match: ""
       $name: Text to look for
@@ -561,6 +603,7 @@ struct Injection {
         std::wstring name;
         winrt::weak_ref<wuxc::Slider> slider;
         winrt::weak_ref<wux::FrameworkElement> icon;
+        winrt::weak_ref<wux::FrameworkElement> iconHost;
         std::shared_ptr<RowTitle> title;
         // Null when the row has none.
         winrt::weak_ref<wuxc::Slider> contrast;
@@ -706,6 +749,10 @@ int g_scrollStep = 5;
 // Clicking a slider's icon jumps it to a level: left, middle, right button.
 bool g_iconClicks = false;
 int g_iconClickLevels[3] = {0, 50, 100};
+// Left-clicking a brightness icon toggles Reduce White Point.
+bool g_whitePointOnIconClick = true;
+int g_whitePointReducePercent = 70;
+brightness::WhitePointMethod g_whitePointMethod = brightness::WhitePointMethod::Auto;
 // Settings for individual displays. The first rule whose text appears in a
 // display's name or device id applies to it. Written only while no panel
 // exists -- a settings change reloads the mod rather than editing this live.
@@ -1406,6 +1453,7 @@ void SetIconLevel(wux::FrameworkElement const& icon, double percent) {
 struct RowTitle {
     std::wstring name;
     wuxc::TextBlock text{nullptr};
+    bool whitePointReduced = false;
     struct Entry {
         winrt::weak_ref<wuxc::Slider> slider;
         bool inDetails;
@@ -1433,6 +1481,9 @@ void UpdateRowTitle(RowTitle const& row) {
         if (auto slider = entry.slider.get()) {
             out += L"  ·  " + std::to_wstring(std::lround(slider.Value())) + L"%";
         }
+    }
+    if (row.whitePointReduced) {
+        out += L"  ·  Dimmed";
     }
     row.text.Text(out);
 }
@@ -1516,6 +1567,7 @@ wux::FrameworkElement MakeContrastIcon() {
     wuxc::FontIcon font;
     font.FontFamily(wuxm::FontFamily(L"Segoe Fluent Icons"));
     font.Glyph(L"\xE7A1");  // Contrast
+    font.FontSize(14);
     font.Width(kIconSize);
     font.Height(kIconSize);
     return font;
@@ -1658,11 +1710,28 @@ void AttachWheel(wuxc::Slider const& slider, Injection& injection) {
         }));
 }
 
+void UpdateWhitePointIconState(wux::FrameworkElement const& host, bool reduced) {
+    if (!host) {
+        return;
+    }
+    host.Opacity(reduced ? 0.55 : 1.0);
+    std::wstring tip = reduced
+        ? L"Reduce White Point: ON (-" + std::to_wstring(g_whitePointReducePercent) + L"%)\nClick to turn off"
+        : L"Click to reduce white point (-" + std::to_wstring(g_whitePointReducePercent) + L"%)";
+    wuxc::ToolTipService::SetToolTip(host, winrt::box_value(winrt::hstring{tip}));
+}
+
 // Clicking a slider's icon jumps it to a level: left, middle and right
-// button each have their own (issue #5697). The icon sits in a Border with a
-// transparent background, since a glyph only hit-tests where it has ink.
+// button each have their own (issue #5697). For brightness icons, left-click
+// can also toggle Reduce White Point when g_whitePointOnIconClick is enabled.
+// The icon sits in a Border with a transparent background, since a glyph only
+// hit-tests where it has ink.
 wux::FrameworkElement MakeIconHost(wux::FrameworkElement const& icon,
-                                   wuxc::Slider const& slider, Injection& injection) {
+                                   wuxc::Slider const& slider, Injection& injection,
+                                   bool isBrightness = false,
+                                   const std::wstring& displayId = L"",
+                                   std::shared_ptr<RowTitle> rowTitle = nullptr,
+                                   std::shared_ptr<PanelLinks> masterLinks = nullptr) {
     wuxc::Border host;
     host.Background(wuxm::SolidColorBrush(winrt::Windows::UI::Colors::Transparent()));
     host.VerticalAlignment(wux::VerticalAlignment::Center);
@@ -1673,10 +1742,17 @@ wux::FrameworkElement MakeIconHost(wux::FrameworkElement const& icon,
     icon.HorizontalAlignment(wux::HorizontalAlignment::Center);
     icon.VerticalAlignment(wux::VerticalAlignment::Center);
     host.Child(icon);
-    if (g_iconClicks) {
+
+    if (isBrightness && g_whitePointOnIconClick && rowTitle) {
+        UpdateWhitePointIconState(host, rowTitle->whitePointReduced);
+    }
+
+    const bool handleWhitePoint = isBrightness && g_whitePointOnIconClick;
+    if (g_iconClicks || handleWhitePoint) {
         injection.pressRevokers.push_back(host.PointerPressed(
             winrt::auto_revoke,
-            [weakHost = winrt::make_weak(host), weakSlider = winrt::make_weak(slider)](
+            [weakHost = winrt::make_weak(host), weakSlider = winrt::make_weak(slider),
+             handleWhitePoint, displayId, rowTitle, masterLinks](
                 wf::IInspectable const&, wux::Input::PointerRoutedEventArgs const& args) {
                 auto h = weakHost.get();
                 auto s = weakSlider.get();
@@ -1684,6 +1760,41 @@ wux::FrameworkElement MakeIconHost(wux::FrameworkElement const& icon,
                     return;
                 }
                 auto props = args.GetCurrentPoint(h).Properties();
+                if (handleWhitePoint && props.IsLeftButtonPressed() && g_engine) {
+                    if (!displayId.empty()) {
+                        bool next = g_engine->ToggleWhitePointReduced(displayId);
+                        if (rowTitle) {
+                            rowTitle->whitePointReduced = next;
+                            UpdateRowTitle(*rowTitle);
+                        }
+                        UpdateWhitePointIconState(h, next);
+                    } else if (masterLinks) {
+                        std::vector<brightness::Display> displays = g_engine->GetDisplays();
+                        bool anyOff = false;
+                        for (const auto& d : displays) {
+                            if (Contains(masterLinks->brightnessIds, d.stableId) &&
+                                !d.whitePointReduced) {
+                                anyOff = true;
+                                break;
+                            }
+                        }
+                        for (const std::wstring& id : masterLinks->brightnessIds) {
+                            g_engine->SetWhitePointReduced(id, anyOff);
+                        }
+                        if (rowTitle) {
+                            rowTitle->whitePointReduced = anyOff;
+                            UpdateRowTitle(*rowTitle);
+                        }
+                        UpdateWhitePointIconState(h, anyOff);
+                        // Request a lightweight UI sync for per-display rows.
+                        g_engine->RequestRefresh();
+                    }
+                    args.Handled(true);
+                    return;
+                }
+                if (!g_iconClicks) {
+                    return;
+                }
                 int level = -1;
                 if (props.IsLeftButtonPressed()) {
                     level = g_iconClickLevels[0];
@@ -2017,8 +2128,18 @@ void PopulateSliderPanel(wuxc::StackPanel const& panel, Injection& injection) {
             wux::FrameworkElement icon = MakeBrightnessIcon();
             wuxc::Slider slider = MakeSlider(average < 0 ? 50 : average, 1.0);
             SetIconLevel(icon, slider.Value());
-            panel.Children().Append(
-                MakeSliderRow(MakeIconHost(icon, slider, injection), slider, nullptr, trailing));
+            bool allReduced = !links->brightnessIds.empty();
+            for (const auto& d : displays) {
+                if (Contains(links->brightnessIds, d.stableId) && !d.whitePointReduced) {
+                    allReduced = false;
+                    break;
+                }
+            }
+            rowTitle->whitePointReduced = allReduced;
+            panel.Children().Append(MakeSliderRow(
+                MakeIconHost(icon, slider, injection, /*isBrightness=*/true, L"",
+                             rowTitle, links),
+                slider, nullptr, trailing));
             links->masterBrightness = winrt::make_weak(slider);
             rowTitle->sliders.push_back({winrt::make_weak(slider), false});
             AttachWheel(slider, injection);
@@ -2168,6 +2289,7 @@ void PopulateSliderPanel(wuxc::StackPanel const& panel, Injection& injection) {
         auto rowTitle = std::make_shared<RowTitle>();
         rowTitle->name = displayName;
         rowTitle->text = title;
+        rowTitle->whitePointReduced = d.whitePointReduced;
         // The device id, for telling identical monitors apart when naming
         // them: the part after the last "&" names the output it is plugged
         // into.
@@ -2233,7 +2355,10 @@ void PopulateSliderPanel(wuxc::StackPanel const& panel, Injection& injection) {
         }
 
         std::wstring id = d.stableId;
-        Injection::Binding binding{id, displayName, {}, {}, rowTitle};
+        Injection::Binding binding;
+        binding.id = id;
+        binding.name = displayName;
+        binding.title = rowTitle;
 
         // The brightness row, and the power button that sits at its end.
         if (g_showPerMonitor) {
@@ -2253,8 +2378,9 @@ void PopulateSliderPanel(wuxc::StackPanel const& panel, Injection& injection) {
                 !(rule && rule->hidePower)) {
                 power = MakePowerButton(d, displayName, injection, links);
             }
-            panel.Children().Append(MakeSliderRow(MakeIconHost(icon, slider, injection), slider,
-                                                  power, trailing));
+            wux::FrameworkElement iconHost = MakeIconHost(
+                icon, slider, injection, /*isBrightness=*/true, id, rowTitle);
+            panel.Children().Append(MakeSliderRow(iconHost, slider, power, trailing));
             AttachWheel(slider, injection);
 
             // auto_revoke so the handler can be detached on unload; a dangling
@@ -2283,6 +2409,7 @@ void PopulateSliderPanel(wuxc::StackPanel const& panel, Injection& injection) {
 
             binding.slider = winrt::make_weak(slider);
             binding.icon = winrt::make_weak(icon);
+            binding.iconHost = winrt::make_weak(iconHost);
         }
 
         // The extra rows go into the dropdown when there is one, straight into
@@ -3229,9 +3356,16 @@ void ApplyRefreshedValues() try {
                 }
             }
 
+            if (auto host = binding.iconHost.get()) {
+                if (g_whitePointOnIconClick) {
+                    UpdateWhitePointIconState(host, d->whitePointReduced);
+                }
+            }
+
             // The sliders' own handlers keep it current as they move; this
             // covers a title that was built before its values were read.
             if (binding.title) {
+                binding.title->whitePointReduced = d->whitePointReduced;
                 UpdateRowTitle(*binding.title);
             }
         }
@@ -4006,10 +4140,17 @@ struct ModSettings {
     int scrollStep = 5;
     bool iconClicks = false;
     int iconClickLevels[3] = {0, 50, 100};
+    bool whitePointOnIconClick = true;
+    int whitePointReducePercent = 70;
+    brightness::WhitePointMethod whitePointMethod = brightness::WhitePointMethod::Auto;
+    bool whitePointScheduleEnabled = false;
+    int whitePointScheduleStartMin = 20 * 60;
+    int whitePointScheduleEndMin = 5 * 60;
     std::vector<DisplayRule> displayRules;
 
-    // Everything but the follow mode changes what is in the shell's visual
-    // tree, which is put right by reloading rather than by patching it live.
+    // Everything but the follow mode and white point engine parameters changes
+    // what is in the shell's visual tree, which is put right by reloading
+    // rather than by patching it live.
     bool SameUi(const ModSettings& other) const {
         return hideStockBrightness == other.hideStockBrightness &&
                hideUnsupported == other.hideUnsupported &&
@@ -4023,6 +4164,7 @@ struct ModSettings {
                showVolume == other.showVolume &&
                showInputSwitcher == other.showInputSwitcher &&
                scrollStep == other.scrollStep && iconClicks == other.iconClicks &&
+               whitePointOnIconClick == other.whitePointOnIconClick &&
                std::equal(std::begin(iconClickLevels), std::end(iconClickLevels),
                           std::begin(other.iconClickLevels)) &&
                displayRules == other.displayRules;
@@ -4033,6 +4175,50 @@ struct ModSettings {
 ModSettings g_settings;
 
 ModSettings ReadSettings() {
+    auto parseTimeMinutes = [](const wchar_t* text, int fallbackMinutes) {
+        if (!text) {
+            return fallbackMinutes;
+        }
+        while (*text == L' ' || *text == L'\t') {
+            ++text;
+        }
+        int hh = 0;
+        int mm = 0;
+        int colonCount = 0;
+        bool hasHourDigit = false;
+        bool hasMinDigit = false;
+        for (const wchar_t* p = text; *p && *p != L' ' && *p != L'\t'; ++p) {
+            if (*p == L':') {
+                ++colonCount;
+                if (colonCount > 1 || !hasHourDigit) {
+                    return fallbackMinutes;
+                }
+                continue;
+            }
+            if (*p < L'0' || *p > L'9') {
+                return fallbackMinutes;
+            }
+            int d = *p - L'0';
+            if (colonCount == 0) {
+                hh = hh * 10 + d;
+                hasHourDigit = true;
+                if (hh > 23) {
+                    return fallbackMinutes;
+                }
+            } else {
+                mm = mm * 10 + d;
+                hasMinDigit = true;
+                if (mm > 59) {
+                    return fallbackMinutes;
+                }
+            }
+        }
+        if (colonCount != 1 || !hasHourDigit || !hasMinDigit) {
+            return fallbackMinutes;
+        }
+        return hh * 60 + mm;
+    };
+
     ModSettings out;
     out.hideStockBrightness = Wh_GetIntSetting(L"hideStockBrightness") != 0;
     out.hideUnsupported = Wh_GetIntSetting(L"hideUnsupported") != 0;
@@ -4075,6 +4261,25 @@ ModSettings ReadSettings() {
     out.iconClickLevels[0] = std::clamp(Wh_GetIntSetting(L"iconClickLeft"), 0, 100);
     out.iconClickLevels[1] = std::clamp(Wh_GetIntSetting(L"iconClickMiddle"), 0, 100);
     out.iconClickLevels[2] = std::clamp(Wh_GetIntSetting(L"iconClickRight"), 0, 100);
+    out.whitePointOnIconClick = Wh_GetIntSetting(L"whitePointOnIconClick") != 0;
+    int wpPct = Wh_GetIntSetting(L"whitePointReducePercent");
+    out.whitePointReducePercent = std::clamp(wpPct == 0 ? 70 : wpPct, 10, 99);
+    WindhawkUtils::StringSetting wpMethod =
+        WindhawkUtils::StringSetting::make(L"whitePointMethod");
+    if (wcscmp(wpMethod.get(), L"gamma") == 0) {
+        out.whitePointMethod = brightness::WhitePointMethod::GammaRamp;
+    } else if (wcscmp(wpMethod.get(), L"ddc") == 0) {
+        out.whitePointMethod = brightness::WhitePointMethod::DdcRgbGain;
+    } else if (wcscmp(wpMethod.get(), L"magnification") == 0) {
+        out.whitePointMethod = brightness::WhitePointMethod::Magnification;
+    }
+    out.whitePointScheduleEnabled = Wh_GetIntSetting(L"whitePointScheduleEnabled") != 0;
+    WindhawkUtils::StringSetting wpSchedStart =
+        WindhawkUtils::StringSetting::make(L"whitePointScheduleStart");
+    out.whitePointScheduleStartMin = parseTimeMinutes(wpSchedStart.get(), 20 * 60);
+    WindhawkUtils::StringSetting wpSchedEnd =
+        WindhawkUtils::StringSetting::make(L"whitePointScheduleEnd");
+    out.whitePointScheduleEndMin = parseTimeMinutes(wpSchedEnd.get(), 5 * 60);
 
     // A fixed bound rather than stopping at the first empty entry, so an
     // entry left blank in the middle of the list does not hide the ones after.
@@ -4115,9 +4320,17 @@ void ApplySettings(const ModSettings& settings) {
     g_iconClicks = settings.iconClicks;
     std::copy(std::begin(settings.iconClickLevels), std::end(settings.iconClickLevels),
               std::begin(g_iconClickLevels));
+    g_whitePointOnIconClick = settings.whitePointOnIconClick;
+    g_whitePointReducePercent = settings.whitePointReducePercent;
+    g_whitePointMethod = settings.whitePointMethod;
     g_displayRules = settings.displayRules;
     if (g_engine) {
         g_engine->SetFollowMode(settings.followMode);
+        g_engine->SetWhitePointConfig(settings.whitePointReducePercent,
+                                      settings.whitePointMethod);
+        g_engine->SetWhitePointSchedule(settings.whitePointScheduleEnabled,
+                                        settings.whitePointScheduleStartMin,
+                                        settings.whitePointScheduleEndMin);
     }
 
     Wh_Log(L"settings: hideStock=%d follow=%d position=%d hideUnsupported=%d "
@@ -4179,10 +4392,22 @@ BOOL Wh_ModSettingsChanged(BOOL* bReload) {
         return TRUE;
     }
 
-    // Follow mode is engine state and takes effect at once.
+    // Follow mode and white point parameters are engine state and take effect at once.
     g_settings.followMode = next.followMode;
+    g_settings.whitePointReducePercent = next.whitePointReducePercent;
+    g_settings.whitePointMethod = next.whitePointMethod;
+    g_settings.whitePointScheduleEnabled = next.whitePointScheduleEnabled;
+    g_settings.whitePointScheduleStartMin = next.whitePointScheduleStartMin;
+    g_settings.whitePointScheduleEndMin = next.whitePointScheduleEndMin;
+    g_whitePointReducePercent = next.whitePointReducePercent;
+    g_whitePointMethod = next.whitePointMethod;
     if (g_engine) {
         g_engine->SetFollowMode(next.followMode);
+        g_engine->SetWhitePointConfig(next.whitePointReducePercent,
+                                      next.whitePointMethod);
+        g_engine->SetWhitePointSchedule(next.whitePointScheduleEnabled,
+                                        next.whitePointScheduleStartMin,
+                                        next.whitePointScheduleEndMin);
     }
     *bReload = FALSE;
     return TRUE;
